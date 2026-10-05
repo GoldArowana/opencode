@@ -5,7 +5,7 @@ import { Credential } from "@opencode/core/credential"
 import { Integration } from "@opencode/core/integration"
 import { McpClient } from "@opencode/core/mcp/client"
 import { McpOAuth } from "@opencode/core/mcp/oauth"
-import { Cause, Effect, Exit } from "effect"
+import { Cause, Effect, Exit, Fiber } from "effect"
 import { hostEnvironmentLayer } from "./fixture/environment"
 
 const authServer = Bun.serve({ port: 0, fetch: () => new Response(null, { status: 404 }) })
@@ -144,8 +144,9 @@ describe("MCP OAuth", () => {
           const redirect = new URL(redirectValue)
           redirect.searchParams.set("code", "accepted")
           redirect.searchParams.set("state", state)
+          const callback = yield* authorization.callback.pipe(Effect.forkScoped)
           expect((yield* Effect.promise(() => fetch(redirect))).status).toBe(200)
-          return yield* authorization.callback
+          return yield* Fiber.join(callback)
         }),
       ),
     ).finally(() => server.stop(true))
@@ -449,8 +450,9 @@ describe("MCP OAuth", () => {
           redirect.searchParams.set("code", "accepted")
           redirect.searchParams.set("state", url.searchParams.get("state")!)
           redirect.searchParams.set("iss", server.url.origin)
+          const callback = yield* authorization.callback.pipe(Effect.forkScoped)
           yield* Effect.promise(() => fetch(redirect))
-          return yield* authorization.callback
+          return yield* Fiber.join(callback)
         }),
       ),
     ).finally(() => server.stop(true))
@@ -470,8 +472,9 @@ describe("MCP OAuth", () => {
             const redirect = new URL(url.searchParams.get("redirect_uri")!)
             redirect.searchParams.set("code", "accepted")
             redirect.searchParams.set("state", url.searchParams.get("state")!)
+            const callback = yield* authorization.callback.pipe(Effect.forkScoped)
             yield* Effect.promise(() => fetch(redirect))
-            return yield* authorization.callback
+            return yield* Fiber.join(callback)
           }),
         ),
       ).finally(() => server.stop(true))

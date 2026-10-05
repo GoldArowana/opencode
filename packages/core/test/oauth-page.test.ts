@@ -2,6 +2,13 @@ import { describe, expect, test } from "bun:test"
 import { OauthCallbackPage } from "../src/oauth/page"
 
 describe("OauthCallbackPage", () => {
+  test("escapes explicit success copy without promising a connection", () => {
+    const html = OauthCallbackPage.success({ message: "Authorization for <Test MCP> is complete." })
+    expect(html).toContain("Authorization for &lt;Test MCP&gt; is complete.")
+    expect(html).not.toContain("now connected")
+    expect(OauthCallbackPage.success({ provider: "Poe" })).toContain("OpenCode is now connected to Poe.")
+  })
+
   test("escapes bootstrap options embedded in the inline script", () => {
     const html = OauthCallbackPage.bootstrap({
       provider: `xAI</script><script>alert("provider")</script>`,

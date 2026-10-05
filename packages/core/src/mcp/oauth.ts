@@ -16,7 +16,8 @@ import {
   type StoredOAuthTokens,
 } from "@modelcontextprotocol/client"
 import { OAuthMetadataSchema, OpenIdProviderDiscoveryMetadataSchema } from "@modelcontextprotocol/core"
-import { Cause, Deferred, Effect } from "effect"
+import { Cause, Deferred, Effect, Exit } from "effect"
+import type { ServerResponse } from "node:http"
 import { ConfigMCP } from "@opencode/schema/config/mcp"
 import { Credential } from "../credential.js"
 import { OauthCallbackPage } from "../oauth/page.js"
@@ -198,7 +199,9 @@ export const provider = (options: Options): OAuthClientProvider => {
     redirectToAuthorization: (url) => {
       if (!redirect) throw refuse("user authorization")
       if (url.protocol !== "http:" && url.protocol !== "https:")
-        throw new Error(`MCP server "${options.config.url}" returned a ${url.protocol} authorization URL; only http and https are supported`)
+        throw new Error(
+          `MCP server "${options.config.url}" returned a ${url.protocol} authorization URL; only http and https are supported`,
+        )
       return redirect.open(url)
     },
     ...(options.invalidate ? { invalidateCredentials: options.invalidate } : {}),
@@ -348,7 +351,7 @@ export const authorize = (input: {
       const client = clientFromCredential(previous)
       if (client) yield* Effect.promise(() => store.saveClientInformation(client))
     }
-    const code = yield* Deferred.make<{ code: string; iss: string | undefined }, Error>()
+    const code = yield* Deferred.make<{ code: string; iss: string | undefined; response: ServerResponse }, Error>()
     const redirect = oauth?.redirect_uri ? new URL(oauth.redirect_uri) : undefined
     const redirectPath = redirect?.pathname ?? "/callback"
     const state = Buffer.from(crypto.getRandomValues(new Uint8Array(32))).toString("base64url")
@@ -361,20 +364,23 @@ export const authorize = (input: {
         response.writeHead(404).end("Not found")
         return
       }
-      const fail = (reason: string, failure: string) => {
+      if (Effect.runSync(Deferred.isDone(code))) {
+        response.writeHead(409).end("OAuth callback already received")
+        return
+      }
+      const fail = (reason: string, failure: string, detail = reason) => {
         runFork(Effect.logWarning("mcp oauth callback rejected", { ...fields, reason: failure }))
-        Effect.runFork(Deferred.fail(code, new Error(reason)))
+        Effect.runSync(Deferred.fail(code, new Error(reason)))
         response
           .writeHead(400, { "Content-Type": "text/html" })
-          .end(OauthCallbackPage.error(reason, { provider: input.name }))
+          .end(OauthCallbackPage.error(detail, { provider: input.name }))
       }
-      const error = url.searchParams.get("error_description") ?? url.searchParams.get("error")
-      if (error) return fail(error, "authorization_error")
       if (url.searchParams.get("state") !== state) return fail("OAuth state mismatch", "state_mismatch")
+      const error = url.searchParams.get("error_description") ?? url.searchParams.get("error")
+      if (error) return fail(error, "authorization_error", "Authorization was denied. Return to OpenCode for details.")
       const value = url.searchParams.get("code")
       if (!value) return fail("Missing authorization code", "missing_code")
-      Effect.runFork(Deferred.succeed(code, { code: value, iss: url.searchParams.get("iss") ?? undefined }))
-      response.writeHead(200, { "Content-Type": "text/html" }).end(OauthCallbackPage.success({ provider: input.name }))
+      Effect.runSync(Deferred.succeed(code, { code: value, iss: url.searchParams.get("iss") ?? undefined, response }))
     })
 
     // callback_port, else the port pinned by redirect_uri, else ephemeral; a mismatch strands the browser.
@@ -390,7 +396,12 @@ export const authorize = (input: {
         )
       })
     })
-    yield* Effect.addFinalizer(() => Effect.sync(() => server.close()))
+    yield* Effect.addFinalizer(() =>
+      Effect.sync(() => {
+        server.close()
+        server.closeAllConnections()
+      }),
+    )
 
     // The server's 401 names where its resource metadata lives and which scopes it wants; without it
     // discovery can only guess the well-known path, which not every server layout answers.
@@ -486,9 +497,26 @@ export const authorize = (input: {
                 fetchFn,
               }),
             catch: (error) => (error instanceof Error ? error : new Error(String(error))),
-          }),
+          }).pipe(
+            Effect.flatMap(() => finalize),
+            Effect.onExit((exit) =>
+              Effect.sync(() => {
+                // Bun can leave an unanswered response pending after closeAllConnections().
+                if (Exit.isFailure(exit) && Cause.hasInterrupts(exit.cause)) {
+                  value.response.destroy()
+                  return
+                }
+                value.response.writeHead(Exit.isSuccess(exit) ? 200 : 400, { "Content-Type": "text/html" }).end(
+                  Exit.isSuccess(exit)
+                    ? OauthCallbackPage.success({ message: `Authorization for ${input.name} is complete.` })
+                    : OauthCallbackPage.error("Token exchange failed. Return to OpenCode for details.", {
+                        provider: input.name,
+                      }),
+                )
+              }),
+            ),
+          ),
         ),
-        Effect.flatMap(() => finalize),
         Effect.onError((cause) =>
           Effect.logWarning("mcp oauth authorization failed", { errors: ErrorSummary.from(Cause.squash(cause)) }),
         ),

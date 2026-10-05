@@ -18,14 +18,18 @@ export interface CallbackPageOptions {
   autoClose?: boolean
 }
 
-export function success(options?: CallbackPageOptions) {
+export function success(options?: CallbackPageOptions & { message?: string }) {
   const provider = options?.provider
   return renderDocument({
     title: "Authorization successful",
     body: renderCard({
       status: "success",
       headline: "Authorization successful",
-      message: provider ? `OpenCode is now connected to ${escapeHtml(provider)}.` : "OpenCode is now authorized.",
+      message: options?.message
+        ? escapeHtml(options.message)
+        : provider
+          ? `OpenCode is now connected to ${escapeHtml(provider)}.`
+          : "OpenCode is now authorized.",
       footnote: "You can close this window.",
     }),
     script: options?.autoClose === false ? undefined : AUTO_CLOSE_SCRIPT,
