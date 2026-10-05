@@ -84,7 +84,10 @@ test("deleting an already missing Home session closes its tab and stays gone aft
     sessions,
     onSessionRemove: (sessionID) => {
       expect(sessionID).toBe(fixture.targetID)
-      sessions.splice(sessions.findIndex((item) => item.id === sessionID), 1)
+      sessions.splice(
+        sessions.findIndex((item) => item.id === sessionID),
+        1,
+      )
 
       return {
         status: 404,

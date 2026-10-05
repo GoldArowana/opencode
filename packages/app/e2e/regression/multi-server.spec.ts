@@ -28,7 +28,10 @@ function pending(id: string, sessionID: string) {
   return { id, sessionID, action: "shell", resources: ["git status"], metadata: {}, save: [] }
 }
 
-async function setup(page: Page, input: { tabs: TabSeed[]; a?: Partial<MockServerConfig>; b?: Partial<MockServerConfig> }) {
+async function setup(
+  page: Page,
+  input: { tabs: TabSeed[]; a?: Partial<MockServerConfig>; b?: Partial<MockServerConfig> },
+) {
   const replies: Reply[] = []
   const lists: URL[] = []
   const sessionGets: string[] = []
@@ -104,11 +107,17 @@ test("a pending missing-session deletion only closes tabs on its originating ser
       onSessionRemove: async (sessionID) => {
         deleting.resolve(sessionID)
         await release.promise
-        sessions.splice(sessions.findIndex((item) => item.id === sessionID), 1)
+        sessions.splice(
+          sessions.findIndex((item) => item.id === sessionID),
+          1,
+        )
 
         return {
           status: 404,
-          body: Data.taggedEnum<SessionNotFoundError>().SessionNotFoundError({ sessionID, message: "Session not found" }),
+          body: Data.taggedEnum<SessionNotFoundError>().SessionNotFoundError({
+            sessionID,
+            message: "Session not found",
+          }),
         }
       },
     },
