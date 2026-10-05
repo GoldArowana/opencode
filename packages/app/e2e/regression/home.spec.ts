@@ -1,4 +1,6 @@
 import { expect, test, type Page } from "@playwright/test"
+import type { SessionNotFoundError } from "@opencode/client/promise"
+import { Data } from "effect"
 import { holdRoute, seed, sessionHref } from "../utils/app"
 import { fixture, mockStressTimeline } from "../utils/session-fixture"
 import { expectAppVisible } from "../utils/waits"
@@ -41,10 +43,12 @@ test("the session context menu renames, exports, and deletes a Home session", as
   await expect(title).toBeFocused()
   await expect(title).toHaveValue(fixture.expected.targetTitle)
   await title.fill("Renamed from Home")
+
   const renamed = page.waitForRequest(
     (request) =>
       request.method() === "PATCH" && new URL(request.url()).pathname.endsWith(`/session/${fixture.targetID}`),
   )
+
   await title.press("Enter")
   expect((await renamed).postDataJSON()).toEqual({ title: "Renamed from Home" })
   const renamedRow = row(page, "Renamed from Home")
@@ -63,12 +67,47 @@ test("the session context menu renames, exports, and deletes a Home session", as
   await page.getByRole("menuitem", { name: "Delete…" }).click()
   const dialog = page.getByRole("dialog")
   await expect(dialog).toContainText('Delete session "Renamed from Home"?')
+
   const removed = page.waitForRequest(
     (request) => request.method() === "DELETE" && new URL(request.url()).pathname.endsWith(`/${fixture.targetID}`),
   )
+
   await dialog.getByRole("button", { name: "Delete session" }).click()
   await removed
   await expect(renamedRow).toBeHidden()
+})
+
+test("deleting an already missing Home session closes its tab and stays gone after reload", async ({ page }) => {
+  const sessions = fixture.sessions.map((item) => ({ ...item }))
+  await seed(page, { tabs: [fixture.targetID] })
+  await openHome(page, {
+    sessions,
+    onSessionRemove: (sessionID) => {
+      expect(sessionID).toBe(fixture.targetID)
+      sessions.splice(sessions.findIndex((item) => item.id === sessionID), 1)
+
+      return {
+        status: 404,
+        body: Data.taggedEnum<SessionNotFoundError>().SessionNotFoundError({ sessionID, message: "Session not found" }),
+      }
+    },
+  })
+  const target = row(page, fixture.expected.targetTitle)
+  const tab = page.locator(`[data-slot="titlebar-tabs"] a[href="${sessionHref(fixture.targetID)}"]`)
+  await expect(target).toBeVisible()
+  await expect(tab).toBeVisible()
+  await target.click({ button: "right" })
+  await page.getByRole("menuitem", { name: "Delete…" }).click()
+  const dialog = page.getByRole("dialog")
+  await dialog.getByRole("button", { name: "Delete session" }).click()
+  await expect(dialog).toBeHidden()
+  await expect(page.getByText("Failed to delete session", { exact: true })).toHaveCount(0)
+  await expect(target).toHaveCount(0)
+  await expect(tab).toHaveCount(0)
+  await page.reload()
+  await expect(row(page, fixture.expected.sourceTitle)).toBeVisible()
+  await expect(target).toHaveCount(0)
+  await expect(tab).toHaveCount(0)
 })
 
 test("Home shows loaded sessions before the location request resolves", async ({ page }) => {
@@ -80,9 +119,11 @@ test("Home shows loaded sessions before the location request resolves", async ({
 
 test("Home and the directory picker load without newer browser APIs", async ({ page }) => {
   await page.addInitScript(() => {
-    // Safari 16.6 has none of these APIs. Remove them before the web entry runs.
+    // SAFETY: optional members let this fixture remove APIs absent from Safari 16.6 before the web entry runs.
     delete (Map as Partial<typeof Map>).groupBy
+    // SAFETY: withResolvers is optional in the older browser simulated by this fixture.
     delete (Promise as Partial<typeof Promise>).withResolvers
+    // SAFETY: try is optional in the older browser simulated by this fixture.
     delete (Promise as Partial<typeof Promise>).try
   })
   await openHome(page, { fileList: () => [] })
@@ -98,6 +139,7 @@ test("Home and the directory picker load without newer browser APIs", async ({ p
 })
 
 const recovery = "C:/OpenCode/Worktrees/project-menu-recovery"
+
 const worktree =
   "C:/OpenCode/Worktrees/project-42/long-folder-name-for-checking-wrapped-worktree-paths/another-long-folder-name"
 
@@ -125,6 +167,7 @@ for (const state of [
       beforeMessagesResponse: (input) =>
         state.recovery && input.sessionID === fixture.targetID ? messages.promise : Promise.resolve(),
     })
+
     // An unopened project has no stored project list or tabs.
     if (state.recovery !== "unopened")
       await seed(page, {
@@ -133,6 +176,7 @@ for (const state of [
         tabs: [fixture.sourceID, fixture.targetID],
       })
     const name = fixture.project.name
+
     if (state.recovery === "closed") {
       await page.goto("/")
       const project = page.locator('[data-component="home-project-row"]').filter({ hasText: name })
@@ -141,6 +185,7 @@ for (const state of [
       await expect(project).toHaveCount(0)
       await page.locator(`[data-titlebar-tab-link][href="${sessionHref(fixture.targetID)}"]`).click()
     }
+
     if (state.recovery !== "closed") await page.goto(sessionHref(fixture.targetID))
 
     const header = page.locator("[data-session-title]")
@@ -150,11 +195,13 @@ for (const state of [
     const pathItem = menu.getByRole("menuitem", { name: state.directory, exact: true })
     const settings = page.getByTestId("settings-screen")
     await expect(header.getByRole("heading")).toHaveText(fixture.expected.targetTitle)
+
     for (const loaded of state.recovery ? [false, true] : [true]) {
       if (state.recovery && loaded) {
         messages.resolve()
         await expect(header.getByRole("button", { name: "More options", exact: true })).toBeVisible()
       }
+
       await expect(trigger.locator("use")).toHaveAttribute("href", `#opencode-v2-icon-${state.icon}`)
       await trigger.click()
       await expect(menu.getByRole("menuitem")).toHaveText([name, state.directory, "Edit project"])
@@ -166,11 +213,13 @@ for (const state of [
       await expect(projectItem).toBeFocused()
       await page.keyboard.press("ArrowDown")
       await expect(pathItem).toBeFocused()
+
       for (const key of ["Enter", "Space"]) {
         await page.keyboard.press(key)
         await expect(menu).toBeVisible()
         await expect(pathItem).toBeFocused()
       }
+
       await page.keyboard.press("ArrowDown")
       await page.keyboard.press("Enter")
       await expect(settings.getByRole("textbox", { name: "Project name", exact: true })).toHaveValue(name)
@@ -211,10 +260,12 @@ test("the project menu path arrow has a glyph when the page has an older icon sp
   const header = page.locator("[data-session-title]")
   await expect(header.getByRole("heading")).toHaveText(fixture.expected.targetTitle)
   await header.getByRole("button", { name: fixture.project.name, exact: true }).click()
+
   const arrow = page
     .getByRole("menu")
     .getByRole("menuitem", { name: fixture.directory, exact: true })
     .locator('[data-slot="session-project-open-icon"]')
+
   await expect(arrow).toHaveCount(1)
   await expect
     .poll(() => arrow.locator("svg").evaluate((element: SVGSVGElement) => element.getBBox().width))
