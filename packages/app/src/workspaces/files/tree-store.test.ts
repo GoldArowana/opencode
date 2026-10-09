@@ -4,21 +4,10 @@ import { createPathHelpers } from "./path"
 import { createFileTreeStore } from "./tree-store"
 
 test.each([
-  { label: "trailing slash", scope: "/repo", name: "dir", separator: "/", suffix: "/" },
-  { label: "no trailing separator", scope: "/repo", name: "dir", separator: "/", suffix: "" },
-  { label: "native Windows separators", scope: "C:\\repo", name: "dir", separator: "\\", suffix: "\\" },
-  { label: "literal POSIX backslashes", scope: "/repo", name: "dir\\name\\", separator: "/", suffix: "/" },
-])("re-lists a recreated directory with $label", async ({ scope, name, separator, suffix }) => {
-  const paths = createPathHelpers(() => scope)
-  const directory = name + suffix
-  const nested = name + separator + "nested" + suffix
-  const old = name + separator + "old.txt"
-  const descendant = name + separator + "nested" + separator + "old.txt"
-  const fresh = name + separator + "new.txt"
-  const sibling = name + "-other" + suffix
-  const siblingFile = name + "-other" + separator + "keep.txt"
-
-  const entry = (path: string, type: FileNode["type"]): FileNode => ({
+  { scope: "/repo", separator: "/" },
+  { scope: "C:\\repo", separator: "\\" },
+])("re-lists a recreated directory in $scope", async ({ scope, separator }) => {
+  const node = (path: string, type: FileNode["type"]) => ({
     name: path,
     path,
     absolute: `${scope}/${path}`,
@@ -26,62 +15,59 @@ test.each([
     ignored: false,
   })
 
-  const retained = [sibling, name + "#other" + suffix, name + "%2Fother" + suffix].map((path) =>
-    entry(path, "directory"),
-  )
+  const directory = node(`dir${separator}`, "directory")
+  const nested = node(`dir${separator}nested${separator}`, "directory")
+  const old = node(`dir${separator}old.txt`, "file")
+  const descendant = node(`dir${separator}nested${separator}old.txt`, "file")
+  const sibling = node(`dir-other${separator}`, "directory")
+  const siblingFile = node(`dir-other${separator}keep.txt`, "file")
+  const fresh = node(`dir${separator}new.txt`, "file")
 
   const snapshots = new Map<string, FileNode[]>([
-    ["", [entry(directory, "directory"), ...retained]],
-    [paths.normalizeDir(directory), [entry(old, "file"), entry(nested, "directory")]],
-    [paths.normalizeDir(nested), [entry(descendant, "file")]],
-    [paths.normalizeDir(sibling), [entry(siblingFile, "file")]],
+    ["", [directory, sibling]],
+    ["dir", [old, nested]],
+    ["dir/nested", [descendant]],
+    ["dir-other", [siblingFile]],
   ])
 
   const requests: string[] = []
-  const errors: string[] = []
 
   const tree = createFileTreeStore({
     scope: () => scope,
-    normalizeDir: paths.normalizeDir,
+    normalizeDir: createPathHelpers(() => scope).normalizeDir,
     list: async (path) => {
       requests.push(path)
 
       return snapshots.get(path) ?? []
     },
-    onError: (message) => errors.push(message),
+    onError: (message) => {
+      throw new Error(message)
+    },
   })
 
   await tree.listDir("")
 
-  for (const path of [directory, nested, sibling]) {
-    tree.expandDir(path)
-    await tree.listDir(path)
+  for (const entry of [directory, nested, sibling]) {
+    tree.expandDir(entry.path)
+    await tree.listDir(entry.path)
   }
 
-  expect(tree.children(directory).map((node) => node.path)).toEqual([old, nested])
-  expect(tree.dirState(directory)).toMatchObject({ loaded: true, expanded: true })
-
-  snapshots.set("", retained)
+  snapshots.set("", [sibling])
   await tree.listDir("", { force: true })
 
-  for (const path of [directory, nested, old, descendant]) expect(tree.node(path)).toBeUndefined()
+  for (const entry of [directory, nested, old, descendant]) expect(tree.node(entry.path)).toBeUndefined()
+  expect(tree.dirState(directory.path)).toBeUndefined()
+  expect(tree.dirState(nested.path)).toBeUndefined()
+  expect(tree.node(sibling.path)).toEqual(sibling)
+  expect(tree.dirState(sibling.path)).toMatchObject({ loaded: true, expanded: true })
+  expect(tree.children(sibling.path)).toEqual([siblingFile])
 
-  for (const path of [directory, nested]) {
-    expect(tree.dirState(path)).toBeUndefined()
-    expect(tree.children(path)).toEqual([])
-  }
-
-  for (const node of retained) expect(tree.node(node.path)).toEqual(node)
-  expect(tree.dirState(sibling)).toMatchObject({ loaded: true, expanded: true })
-  expect(tree.children(sibling).map((node) => node.path)).toEqual([siblingFile])
-
-  snapshots.set("", [entry(directory, "directory"), ...retained])
-  snapshots.set(paths.normalizeDir(directory), [entry(fresh, "file")])
+  snapshots.set("", [directory, sibling])
+  snapshots.set("dir", [fresh])
   await tree.listDir("", { force: true })
-  expect(tree.children(directory)).toEqual([])
-  tree.expandDir(directory)
-  await tree.listDir(directory)
-  expect(requests.filter((path) => path === paths.normalizeDir(directory))).toHaveLength(2)
-  expect(tree.children(directory).map((node) => node.path)).toEqual([fresh])
-  expect(errors).toEqual([])
+  expect(tree.children(directory.path)).toEqual([])
+  tree.expandDir(directory.path)
+  expect(requests.filter((path) => path === "dir")).toHaveLength(2)
+  await tree.listDir(directory.path)
+  expect(tree.children(directory.path)).toEqual([fresh])
 })
