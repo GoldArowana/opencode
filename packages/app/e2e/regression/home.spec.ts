@@ -1,11 +1,11 @@
 import { expect, test, type Page } from "@playwright/test"
 import type { SessionNotFoundError } from "@opencode/client/promise"
 import { Data } from "effect"
-import { holdRoute, NO_PROVIDER, project, REMOTE_SERVER, seed, sessionHref } from "../utils/app"
+import { expectPath, holdRoute, NO_PROVIDER, project, REMOTE_SERVER, seed, sessionHref } from "../utils/app"
 import { mockOpenCodeServer } from "../utils/mock-server"
 import { fixture, mockStressTimeline } from "../utils/session-fixture"
 import { mockRemoteServer } from "../utils/workspace"
-import { expectAppVisible } from "../utils/waits"
+import { APP_READY_TIMEOUT, expectAppVisible } from "../utils/waits"
 
 test.use({ serviceWorkers: "block" })
 
@@ -113,6 +113,33 @@ test("deleting an already missing Home session closes its tab and stays gone aft
   await expect(row(page, fixture.expected.sourceTitle)).toBeVisible()
   await expect(target).toHaveCount(0)
   await expect(tab).toHaveCount(0)
+})
+
+test("the Home shortcut focuses session search, and the Home button leaves focus alone", async ({ page }) => {
+  await mockStressTimeline(page)
+  await seed(page, {
+    projects: { local: [{ worktree: fixture.directory, expanded: true }] },
+    lastProject: { local: fixture.directory },
+    tabs: [fixture.sourceID],
+  })
+  await page.goto(sessionHref(fixture.sourceID))
+  const editor = page.locator('[data-component="composer-editor"]')
+  await expect(editor).toBeEditable({ timeout: APP_READY_TIMEOUT })
+  await editor.click()
+
+  await page.keyboard.press("ControlOrMeta+b")
+  const search = page.getByRole("textbox", { name: /Search sessions/ })
+  await expect(search).toBeFocused()
+  await page.keyboard.type("jump")
+  await expect(page.getByRole("option")).toHaveCount(1)
+  await expect(page.getByRole("option")).toContainText(fixture.expected.targetTitle)
+
+  await page.keyboard.press("ControlOrMeta+b")
+  await expectPath(page, sessionHref(fixture.sourceID))
+
+  await page.getByRole("button", { name: "Home", exact: true }).click()
+  await expect(search).toHaveValue("")
+  await expect(search).not.toBeFocused()
 })
 
 test("Home shows loaded sessions before the location request resolves", async ({ page }) => {
