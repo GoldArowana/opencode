@@ -12,7 +12,7 @@ import { Provider } from "@opencode/core/provider"
 import { Document, Event, Info } from "@opencode/schema/config"
 import { expect } from "bun:test"
 import { Deferred, Effect, Fiber, Layer, Schema, Stream } from "effect"
-import { HttpClient, HttpClientResponse } from "effect/unstable/http"
+import { HttpClient, HttpClientResponse } from "effect/http"
 import { testEffect } from "../lib/effect"
 import { PluginTestLayer } from "./fixture"
 
