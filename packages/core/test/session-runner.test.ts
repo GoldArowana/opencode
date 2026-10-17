@@ -19,6 +19,7 @@ import {
 import { OpenAIChat } from "@opencode/ai/protocols/openai-chat"
 import { AnthropicMessages, OpenAIResponses } from "@opencode/ai/protocols"
 import { compileRequest } from "@opencode/ai/route/client"
+import { RequestExecutor } from "@opencode/ai/route"
 import { TestLLM } from "@opencode/ai/testing"
 import type { SessionHooks } from "@opencode/plugin/effect/session"
 import { Database } from "@opencode/core/database/database"
@@ -79,6 +80,7 @@ import { Location } from "@opencode/core/location"
 import { Provider } from "@opencode/core/provider"
 import { Cause, Context, DateTime, Deferred, Effect, Exit, Fiber, Layer, Queue, Schema, Scope, Stream } from "effect"
 import { TestClock } from "effect/testing"
+import { HttpClient, HttpClientRequest, HttpClientResponse } from "effect/http"
 import { asc, desc, eq, sql } from "drizzle-orm"
 import { testEffect } from "./lib/effect"
 import { promptLocationNode } from "./fixture/prompt-location"
@@ -3424,16 +3426,31 @@ describe("SessionRunnerLLM", () => {
     ])
   })
 
-  scenario("recovers once from a raw context overflow failure", function* (s) {
+  scenario("recovers once from an HTTP configured model input limit failure", function* (s) {
     yield* setupOverflowRecovery(s)
-    yield* s.llm.push(
-      Stream.fail(
-        new AIError({
-          reason: new InvalidRequestError({
-            message: "prompt too long",
-            classification: "context-overflow",
-          }),
+    let httpRequests = 0
+    const http = Layer.succeed(
+      HttpClient.HttpClient,
+      HttpClient.make((request) =>
+        Effect.sync(() => {
+          httpRequests++
+          return HttpClientResponse.fromWeb(
+            request,
+            new Response(
+              `{"error":{"type":"unsupported_request","code":"unsupported_request","message":"This text request is too large for the model's configured input limit."}}`,
+              { status: 400, headers: { "content-type": "application/json" } },
+            ),
+          )
         }),
+      ),
+    )
+    yield* s.llm.push(
+      Stream.unwrap(
+        Effect.gen(function* () {
+          const executor = yield* RequestExecutor.Service
+          yield* executor.execute(HttpClientRequest.post("https://provider.test/v1/chat/completions"))
+          return Stream.empty
+        }).pipe(Effect.provide(RequestExecutor.layer.pipe(Layer.provide(http)))),
       ),
     )
     yield* s.llm.push(
@@ -3442,10 +3459,11 @@ describe("SessionRunnerLLM", () => {
     )
     yield* s.runPrompt("Continue")
 
+    expect(httpRequests).toBe(1)
     expect(s.requests).toHaveLength(3)
     expect(yield* s.context).toMatchObject([
-      { type: "compaction", summary: "## Objective\n- Recover raw overflow" },
-      { type: "assistant", finish: "stop" },
+      { type: "compaction", status: "completed", summary: "## Objective\n- Recover raw overflow" },
+      { type: "assistant", finish: "stop", content: [{ type: "text", text: "Recovered" }] },
     ])
   })
 

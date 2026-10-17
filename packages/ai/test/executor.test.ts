@@ -290,6 +290,63 @@ describe("RequestExecutor", () => {
     ),
   )
 
+  for (const response of [
+    {
+      name: "plain configured model input limit",
+      body: "This text request is too large for the model's configured input limit.",
+      status: 400,
+      tag: "InvalidRequest",
+      classification: "context-overflow",
+    },
+    {
+      name: "JSON configured model input limit",
+      body: `{"error":{"type":"unsupported_request","code":"unsupported_request","message":"This text request is too large for the model's configured input limit."}}`,
+      status: 400,
+      tag: "InvalidRequest",
+      classification: "context-overflow",
+    },
+    {
+      name: "configured model output limit",
+      body: "This text request is too large for the model's configured output limit.",
+      status: 400,
+      tag: "InvalidRequest",
+      classification: undefined,
+    },
+    {
+      name: "configured account input limit",
+      body: "This text request is too large for the account's configured input limit.",
+      status: 400,
+      tag: "InvalidRequest",
+      classification: undefined,
+    },
+    {
+      name: "invalid input limit parameter",
+      body: "input limit must be positive",
+      status: 400,
+      tag: "InvalidRequest",
+      classification: undefined,
+    },
+    {
+      name: "server failure with input limit text",
+      body: "This text request is too large for the model's configured input limit.",
+      status: 500,
+      tag: "ProviderInternal",
+      classification: undefined,
+    },
+  ]) {
+    it.effect(`classifies ${response.name}`, () =>
+      Effect.gen(function* () {
+        const executor = yield* RequestExecutor.Service
+        const error = yield* executor.execute(request).pipe(Effect.flip)
+
+        expectAIError(error)
+        expect(error.reason).toMatchObject({ _tag: response.tag })
+        expect("classification" in error.reason ? error.reason.classification : undefined).toBe(response.classification)
+        expect(error.reason.http?.status).toBe(response.status)
+      }).pipe(Effect.provide(fixedResponse(response.body, { status: response.status }))),
+    )
+  }
+
   it.effect("classifies generic HTTP 413 payload errors", () =>
     Effect.gen(function* () {
       const executor = yield* RequestExecutor.Service

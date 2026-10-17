@@ -16,6 +16,7 @@ import {
 const patterns = [
   /prompt is too long/i,
   /input is too long for requested model/i,
+  /text request is too large for the model's configured input limit/i,
   // Cloudflare Workers AI reports this as HTTP 413.
   /exceeded this model context window limit/i,
   /exceeds the context window/i,
