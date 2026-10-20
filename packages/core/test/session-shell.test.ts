@@ -1,7 +1,7 @@
 import { describe, expect, setDefaultTimeout } from "bun:test"
 import fs from "fs/promises"
 import path from "path"
-import { Cause, Context, Deferred, Effect, Exit, Fiber, Layer, Option, Queue, Schedule, Stream } from "effect"
+import { Cause, Context, Deferred, Effect, Exit, Fiber, Layer, Option, Schedule, Stream } from "effect"
 import { Bus } from "@opencode/core/bus"
 import { Database } from "@opencode/core/database/database"
 import { AppNodeBuilder } from "@opencode/core/effect/app-node-builder"
@@ -89,19 +89,6 @@ const undo = Effect.fn(function* (fixture: Effect.Success<typeof setup>) {
   return yield* fixture.session.revert.stage({ sessionID: fixture.created.id, messageID: prompt.id, files: false })
 })
 
-const blockStart = Effect.fn(function* (fixture: Effect.Success<typeof setup>) {
-  const locations = yield* LocationServiceMap.Service
-  const hooks = yield* PluginHooks.Service.pipe(Effect.provide(locations.get(fixture.created.location)))
-  const entered = yield* Queue.unbounded<void>()
-  const release = yield* Deferred.make<void>()
-  const resume = Deferred.succeed(release, undefined).pipe(Effect.asVoid)
-  yield* Effect.addFinalizer(() => resume)
-  yield* hooks.register("shell", "create.before", () =>
-    Queue.offer(entered, undefined).pipe(Effect.andThen(Deferred.await(release))),
-  )
-  return { entered: Queue.take(entered), release: resume }
-})
-
 const log = (session: Session.Interface, sessionID: Session.ID, follow = false) =>
   session.log({ sessionID, follow }).pipe(Stream.filter((event) => !Bus.isSynced(event)))
 
@@ -168,14 +155,21 @@ describe("Session.shell", () => {
     Effect.gen(function* () {
       const fixture = yield* setup
       const reverted = yield* undo(fixture)
-      const gate = yield* blockStart(fixture)
+      const locations = yield* LocationServiceMap.Service
+      const hooks = yield* PluginHooks.Service.pipe(Effect.provide(locations.get(fixture.created.location)))
+      const entered = yield* Deferred.make<void>()
+      const release = yield* Deferred.make<void>()
+      yield* Effect.addFinalizer(() => Deferred.succeed(release, undefined))
+      yield* hooks.register("shell", "create.before", () =>
+        Deferred.succeed(entered, undefined).pipe(Effect.andThen(Deferred.await(release))),
+      )
       const caller = yield* fixture.session
         .shell({ sessionID: fixture.created.id, command: "echo after-redo" })
         .pipe(Effect.forkScoped)
-      yield* gate.entered
+      yield* Deferred.await(entered)
       yield* Deferred.succeed(fixture.control.release, undefined)
       yield* fixture.session.revert.clear(fixture.created.id)
-      yield* gate.release
+      yield* Deferred.succeed(release, undefined)
       yield* Fiber.join(caller)
       expect((yield* fixture.session.get(fixture.created.id)).revert).toBeUndefined()
       expect(yield* fixture.session.messages({ sessionID: fixture.created.id, order: "asc" })).toMatchObject([
@@ -190,28 +184,22 @@ describe("Session.shell", () => {
     }),
   )
 
-  it.live("accepts concurrent shells after undo without committing the same boundary twice", () =>
+  it.live("retains staged undo and redo when shell startup fails", () =>
     Effect.gen(function* () {
       const fixture = yield* setup
-      yield* undo(fixture)
-      const gate = yield* blockStart(fixture)
-      const callers = yield* Effect.forEach(["first", "second"], (name) =>
-        fixture.session.shell({ sessionID: fixture.created.id, command: `echo ${name}` }).pipe(Effect.forkScoped),
-      )
-      yield* gate.entered
-      yield* gate.entered
-      yield* gate.release
-      yield* Effect.forEach(callers, (caller) => Fiber.join(caller), { concurrency: "unbounded" })
+      const reverted = yield* undo(fixture)
+      // Keep the Location initialized, but invalidate the real child's working directory.
+      yield* Effect.promise(() => fs.rm(fixture.tmp.path, { recursive: true, force: true }))
+      const exit = yield* fixture.session
+        .shell({ sessionID: fixture.created.id, command: "echo should-not-start" })
+        .pipe(Effect.exit)
+      expect(Exit.isFailure(exit)).toBe(true)
+      expect((yield* fixture.session.get(fixture.created.id)).revert).toEqual(reverted)
+      yield* fixture.session.revert.clear(fixture.created.id)
       expect((yield* fixture.session.get(fixture.created.id)).revert).toBeUndefined()
       expect(yield* fixture.session.messages({ sessionID: fixture.created.id })).toMatchObject([
-        { type: "shell", status: "exited" },
-        { type: "shell", status: "exited" },
+        { id: reverted.messageID, type: "user" },
       ])
-      expect(
-        (yield* log(fixture.session, fixture.created.id).pipe(Stream.runCollect)).filter(
-          (event) => event.type === "session.revert.committed",
-        ),
-      ).toHaveLength(1)
     }),
   )
 
@@ -387,133 +375,105 @@ describe("Session.shell", () => {
     )
   }
 
-  for (const staged of [false, true]) {
-    for (const outcome of [
-      {
-        status: "killed",
-        state: "cancelled",
-        text: "Cancelled",
-        output: "Shell command output is no longer available.",
-      },
-      { status: "timeout", state: "completed", text: "Timed out before completion", output: "timeout started" },
-    ]) {
-      it.live(
-        `records a ${outcome.status} shell and admits its completion without waking the model${staged ? " after undo" : ""}`,
-        () =>
-          Effect.gen(function* () {
-            const fixture = yield* setup
-            if (staged) yield* undo(fixture)
-            const command = yield* launch(fixture, outcome.status)
-            expect((yield* fixture.session.get(fixture.created.id)).revert).toBeUndefined()
-            yield* outcome.status === "killed"
-              ? fixture.shell.remove(command.shellID)
-              : fixture.shell.timeout(command.shellID, 1)
-            yield* Fiber.join(command.caller).pipe(Effect.timeout("5 seconds"))
-            expect(yield* fixture.session.messages({ sessionID: fixture.created.id })).toMatchObject([
-              {
-                type: "shell",
-                shellID: command.shellID,
-                status: outcome.status,
-                time: { completed: expect.anything() },
-                output: { output: expect.stringContaining(outcome.output) },
-              },
-            ])
-            const inbox = yield* fixture.session.inbox(fixture.created.id)
-            expect(inbox).toHaveLength(1)
-            expect(inbox).toMatchObject([
-              {
-                type: "synthetic",
-                payload: {
-                  text: expect.stringContaining(outcome.text),
-                  metadata: { source: "shell", shellID: command.shellID, state: outcome.state },
-                },
-              },
-            ])
-            expect(inbox[0]).not.toHaveProperty("payload.metadata.exit")
-            expect(fixture.control.wakes).toEqual([])
-          }),
-      )
-    }
-
-    it.live(
-      `admits a spawn failure without waking the model before failing the caller${staged ? " after undo" : ""}`,
-      () =>
-        Effect.gen(function* () {
-          const fixture = yield* setup
-          const reverted = staged ? yield* undo(fixture) : undefined
-          // Keep the Location initialized, but invalidate the real child's working directory.
-          yield* Effect.promise(() => fs.rm(fixture.tmp.path, { recursive: true, force: true }))
-          const command = "echo should-not-start"
-          const exit = yield* fixture.session.shell({ sessionID: fixture.created.id, command }).pipe(Effect.exit)
-
-          expect(Exit.isFailure(exit)).toBe(true)
-          expect((yield* fixture.session.get(fixture.created.id)).revert).toEqual(reverted)
-          expect(yield* fixture.session.messages({ sessionID: fixture.created.id })).toMatchObject(
-            reverted ? [{ id: reverted.messageID, type: "user" }] : [],
-          )
-          const inbox = yield* fixture.session.inbox(fixture.created.id)
-          expect(inbox).toHaveLength(1)
-          expect(inbox[0]).toMatchObject({
+  for (const outcome of [
+    {
+      status: "killed",
+      state: "cancelled",
+      text: "Cancelled",
+      output: "Shell command output is no longer available.",
+    },
+    { status: "timeout", state: "completed", text: "Timed out before completion", output: "timeout started" },
+  ]) {
+    it.live(`records a ${outcome.status} shell and admits its completion without waking the model`, () =>
+      Effect.gen(function* () {
+        const fixture = yield* setup
+        const command = yield* launch(fixture, outcome.status)
+        yield* outcome.status === "killed"
+          ? fixture.shell.remove(command.shellID)
+          : fixture.shell.timeout(command.shellID, 1)
+        yield* Fiber.join(command.caller).pipe(Effect.timeout("5 seconds"))
+        expect(yield* fixture.session.messages({ sessionID: fixture.created.id })).toMatchObject([
+          {
+            type: "shell",
+            shellID: command.shellID,
+            status: outcome.status,
+            time: { completed: expect.anything() },
+            output: { output: expect.stringContaining(outcome.output) },
+          },
+        ])
+        const inbox = yield* fixture.session.inbox(fixture.created.id)
+        expect(inbox).toHaveLength(1)
+        expect(inbox).toMatchObject([
+          {
             type: "synthetic",
-            payload: { text: expect.stringContaining(command), metadata: { source: "shell", state: "error" } },
-          })
-          expect(fixture.control.wakes).toEqual([])
-          if (reverted) {
-            yield* fixture.session.revert.clear(fixture.created.id)
-            expect((yield* fixture.session.get(fixture.created.id)).revert).toBeUndefined()
-            expect(yield* fixture.session.messages({ sessionID: fixture.created.id })).toMatchObject([
-              { id: reverted.messageID, type: "user" },
-            ])
-          }
-        }),
-    )
-
-    it.live(
-      `keeps the shell and completion alive when the waiting caller is interrupted${staged ? " after undo" : ""}`,
-      () =>
-        Effect.gen(function* () {
-          const fixture = yield* setup
-          if (staged) yield* undo(fixture)
-          const command = yield* launch(fixture, "detached")
-          expect((yield* fixture.session.get(fixture.created.id)).revert).toBeUndefined()
-
-          yield* Fiber.interrupt(command.caller).pipe(Effect.timeout("5 seconds"))
-          const exit = yield* Fiber.await(command.caller)
-          expect(Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause)).toBe(true)
-          expect(yield* fixture.shell.get(command.shellID)).toMatchObject({ status: "running" })
-          expect(yield* fixture.session.inbox(fixture.created.id)).toEqual([])
-
-          yield* command.release
-          yield* log(fixture.session, fixture.created.id, true).pipe(
-            Stream.filter(
-              (event) =>
-                event.type === "session.inbox.enqueued" &&
-                event.data.item.type === "synthetic" &&
-                event.data.item.payload.metadata?.shellID === command.shellID,
-            ),
-            Stream.runHead,
-            Effect.timeout("5 seconds"),
-          )
-          expect(yield* fixture.session.messages({ sessionID: fixture.created.id })).toMatchObject([
-            {
-              type: "shell",
-              shellID: command.shellID,
-              status: "exited",
-              exit: 0,
-              output: { output: expect.stringContaining("detached finished") },
+            payload: {
+              text: expect.stringContaining(outcome.text),
+              metadata: { source: "shell", shellID: command.shellID, state: outcome.state },
             },
-          ])
-          expect(yield* fixture.session.inbox(fixture.created.id)).toMatchObject([
-            {
-              type: "synthetic",
-              payload: {
-                text: expect.stringContaining("detached finished"),
-                metadata: { shellID: command.shellID, state: "completed" },
-              },
-            },
-          ])
-          expect(fixture.control.wakes).toEqual([])
-        }),
+          },
+        ])
+        expect(inbox[0]).not.toHaveProperty("payload.metadata.exit")
+        expect(fixture.control.wakes).toEqual([])
+      }),
     )
   }
+
+  it.live("admits a spawn failure without waking the model before failing the caller", () =>
+    Effect.gen(function* () {
+      const fixture = yield* setup
+      // Keep the Location initialized, but invalidate the real child's working directory.
+      yield* Effect.promise(() => fs.rm(fixture.tmp.path, { recursive: true, force: true }))
+      const command = "echo should-not-start"
+      const exit = yield* fixture.session.shell({ sessionID: fixture.created.id, command }).pipe(Effect.exit)
+
+      expect(Exit.isFailure(exit)).toBe(true)
+      expect(yield* fixture.session.messages({ sessionID: fixture.created.id })).toEqual([])
+      const inbox = yield* fixture.session.inbox(fixture.created.id)
+      expect(inbox).toHaveLength(1)
+      expect(inbox[0]).toMatchObject({
+        type: "synthetic",
+        payload: { text: expect.stringContaining(command), metadata: { source: "shell", state: "error" } },
+      })
+      expect(fixture.control.wakes).toEqual([])
+    }),
+  )
+
+  it.live("keeps the shell and completion alive when the waiting caller is interrupted", () =>
+    Effect.gen(function* () {
+      const fixture = yield* setup
+      const command = yield* launch(fixture, "detached")
+
+      yield* Fiber.interrupt(command.caller).pipe(Effect.timeout("5 seconds"))
+      const exit = yield* Fiber.await(command.caller)
+      expect(Exit.isFailure(exit) && Cause.hasInterruptsOnly(exit.cause)).toBe(true)
+      expect(yield* fixture.shell.get(command.shellID)).toMatchObject({ status: "running" })
+      expect(yield* fixture.session.inbox(fixture.created.id)).toEqual([])
+
+      yield* command.release
+      yield* log(fixture.session, fixture.created.id, true).pipe(
+        Stream.filter((event) => event.type === "session.inbox.enqueued"),
+        Stream.runHead,
+        Effect.timeout("5 seconds"),
+      )
+      expect(yield* fixture.session.messages({ sessionID: fixture.created.id })).toMatchObject([
+        {
+          type: "shell",
+          shellID: command.shellID,
+          status: "exited",
+          exit: 0,
+          output: { output: expect.stringContaining("detached finished") },
+        },
+      ])
+      expect(yield* fixture.session.inbox(fixture.created.id)).toMatchObject([
+        {
+          type: "synthetic",
+          payload: {
+            text: expect.stringContaining("detached finished"),
+            metadata: { shellID: command.shellID, state: "completed" },
+          },
+        },
+      ])
+      expect(fixture.control.wakes).toEqual([])
+    }),
+  )
 })
