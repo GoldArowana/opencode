@@ -3,6 +3,8 @@ import fs from "node:fs/promises"
 import os from "node:os"
 import path from "node:path"
 import { OPENCODE_VERSION } from "../src/version"
+import { isolatedEnv } from "./fixture/environment"
+import { tmpdir } from "./fixture/tmpdir"
 
 const info = {
   id: "ses_export_test",
@@ -145,6 +147,74 @@ test("export reports a missing session without a stack trace", async () => {
     expect(exitCode).toBe(1)
     expect(stdout).toBe("")
     expect(stderr).toBe(`Session not found: ${sessionID}${os.EOL}`)
+  } finally {
+    await server.stop(true)
+  }
+})
+
+// Bash creates an OS pipe; Bun.spawn's own "pipe" transport can use a socketpair.
+// This fixture requires a POSIX shell, which is not available on Windows runners.
+test.skipIf(process.platform === "win32")("export completes a large pipe write and permits early closure", async () => {
+  await using root = await tmpdir()
+  const data = {
+    ...transfer,
+    messages: [{ ...transfer.messages[0], text: "x".repeat(1_200_000) }],
+  }
+  const expected = JSON.stringify(data, null, 2) + os.EOL
+  const server = Bun.serve({
+    port: 0,
+    fetch(request) {
+      const url = new URL(request.url)
+      if (url.pathname === "/api/info") return status()
+      if (url.pathname === `/api/experimental/session/${info.id}/export`) return Response.json({ data })
+      return new Response("Not found", { status: 404 })
+    },
+  })
+
+  try {
+    for (const mode of ["drain", "close"]) {
+      await using child = Bun.spawn(
+        [
+          "bash",
+          "-o",
+          "pipefail",
+          "-c",
+          'runtime=$1; reader=$2; mode=$3; shift 3; "$@" | "$runtime" "$reader" "$mode"',
+          "--",
+          process.execPath,
+          path.join(import.meta.dir, "fixture/export-reader.ts"),
+          mode,
+          process.execPath,
+          "run",
+          "src/index.ts",
+          "session",
+          "export",
+          info.id,
+          "--server",
+          server.url.toString(),
+        ],
+        {
+          cwd: path.join(import.meta.dir, ".."),
+          env: isolatedEnv(root.path),
+          stdin: "ignore",
+          stdout: "pipe",
+          stderr: "pipe",
+        },
+      )
+      const [stdout, stderr, exitCode] = await Promise.all([
+        new Response(child.stdout).text(),
+        new Response(child.stderr).text(),
+        child.exited,
+      ])
+      expect(stderr).toBe("")
+      expect(exitCode).toBe(0)
+      if (mode === "close") {
+        expect(stdout).toBe(expected.slice(0, 1))
+        continue
+      }
+      expect(stdout.length).toBe(expected.length)
+      expect(stdout).toBe(expected)
+    }
   } finally {
     await server.stop(true)
   }
