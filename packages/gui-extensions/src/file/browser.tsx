@@ -18,7 +18,7 @@ import {
 import { current, useShared } from "./context"
 import SessionFileList, { applyFileListKeyDown } from "./list"
 import { fileTabPath, isFileTab } from "./path"
-import FileTreeV2 from "./tree-v2"
+import PierreFileTree from "./pierre-tree"
 import { SessionFileView } from "./view"
 
 const emptyFiles: string[] = []
@@ -38,11 +38,12 @@ export function SessionFileBrowserTab(props: {
   mobile?: boolean
 }) {
   const ctx = useExtension()
+  const shared = useShared()
   const file = props.screen.file
   const resultsID = `session-file-browser-results-${createUniqueId()}`
-  const [store, setStore] = createStore<{ filter: string; explicitHighlight?: string }>({ filter: "" })
-  const filter = () => store.filter
-  const setFilter = (value: string) => setStore("filter", value)
+  const [store, setStore] = createStore<{ explicitHighlight?: string }>({})
+  const filter = () => shared.filter.get(props.session.key)
+  const setFilter = (value: string) => shared.filter.set(props.session.key, value)
   const setExplicitHighlight = (value: string) => setStore("explicitHighlight", value)
   const sidebarOpened = () => props.placeholder || props.state.opened()
   const query = createMemo(() => filter().trim())
@@ -136,7 +137,7 @@ export function SessionFileBrowserTab(props: {
           <Show
             when={query()}
             fallback={
-              <FileTreeV2
+              <PierreFileTree
                 session={props.session}
                 screen={props.screen}
                 active={props.active}
@@ -221,9 +222,9 @@ export default function FileBrowser(props: {
   const empty = new Map<string, ChangeKind>()
   const changes = () => current(shared.changes())
 
-  // Change markers in the tree load while a file tab shows, as the side panel did.
+  // Change markers in the tree load while a file tab or the file browser shows.
   createKeyed(
-    () => (panel.visible() && !placeholder() ? changes() : undefined),
+    () => (panel.visible() ? changes() : undefined),
     (service) => onCleanup(service.watch(props.screen, "files")),
   )
 

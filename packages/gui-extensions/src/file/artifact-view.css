@@ -41,6 +41,20 @@
     0 12px 32px -12px color-mix(in oklch, var(--v2-text-text-base) 25%, transparent);
 }
 
+[data-slot="artifact-media"]::-webkit-media-controls-fullscreen-button {
+  visibility: hidden;
+  pointer-events: none;
+}
+
+[data-slot="artifact-video-fullscreen"] {
+  color: #ffffff;
+}
+
+[data-slot="artifact-video-fullscreen"]:hover > span,
+[data-slot="artifact-video-fullscreen"]:focus-visible > span {
+  background-color: rgb(0 0 0 / 0.55);
+}
+
 [data-slot="artifact-stage"][data-zoom="fit"] [data-slot="artifact-media"] {
   max-width: 100%;
   max-height: 100%;

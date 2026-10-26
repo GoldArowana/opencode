@@ -2,7 +2,7 @@ import { batch, createRoot, createSignal, getOwner, onCleanup } from "solid-js"
 import { createStore, reconcile } from "solid-js/store"
 import { makeEventListener } from "@solid-primitives/event-listener"
 import type { Browser } from "@opencode/plugin-browser/rpc"
-import { createKeyed, type Link, type SessionRef, type SetupContext } from "../sdk"
+import { createKeyed, type SessionRef, type SetupContext } from "../sdk"
 import { readHref } from "./comment"
 import {
   createConnection,
@@ -10,11 +10,12 @@ import {
   type Connection,
   type InspectEvent,
   type Registration,
+  type ShortcutEvent,
   type Zoom,
 } from "./connection"
 import { recordable, remember, withIcon } from "./history"
 import type definition from "./index"
-import { isHtml, resolveLink, workspaceFileURL } from "./link"
+import { workspaceFileURL } from "./link"
 import { BrowserPane, type PaneEvent } from "./ipc"
 
 type Session = Pick<SessionRef, "key">
@@ -57,11 +58,17 @@ type PaneHandle = {
   visible: () => boolean
   address: () => string
   reload: () => void
+  /** Closes the selected browser tab, including a blank page. */
+  close: () => void
   inspectable: () => boolean
   /** Turns the element picker on or off. */
   inspect: () => void
   /** Focuses the address field and selects its text. */
   focusAddress: () => void
+  /** Runs a key press the page handed to the app, as if it was pressed in this pane. */
+  press: (event: ShortcutEvent) => void
+  /** Marks the pane as holding the user's focus, which the page took outside the window's document. */
+  focused: () => void
 }
 
 export type Model = ReturnType<typeof createModel>
@@ -89,7 +96,6 @@ export function createModel(ctx: SetupContext<typeof definition>) {
   const live = new Map<string, Live>()
   const listeners = new Map<string, (event: PaneEvent) => void>()
   const inspectors = new Map<string, Set<(event: InspectEvent) => void>>()
-  const addressed = new Map<string, Set<(tabID: Browser.TabID) => void>>()
   // Sessions where the user just opened a tab; its pane focuses the address field once the blank page shows.
   const opening = new Set<string>()
   // Each tab's last recorded page, so a state that repeats it does not write the history again.
@@ -151,8 +157,9 @@ export function createModel(ctx: SetupContext<typeof definition>) {
   )
 
   const close = (id: string) => {
-    live.get(id)?.dispose()
+    const entry = live.get(id)
     live.delete(id)
+    entry?.dispose()
     opening.delete(id)
     Array.from(recorded.keys())
       .filter((item) => item.startsWith(`${id}\n`))
@@ -207,7 +214,13 @@ export function createModel(ctx: SetupContext<typeof definition>) {
 
           if (visits) history.set({ visits })
         },
-        address: (tabID) => addressed.get(id)?.forEach((listener) => listener(tabID)),
+        // Only the pane on screen holds the page that had focus.
+        shortcut: (event) => {
+          if (sessions.current()?.key === id) panes()[0]?.press(event)
+        },
+        focused: () => {
+          if (sessions.current()?.key === id) panes()[0]?.focused()
+        },
         change: (next, mirror, native) => {
           if (next.error === "browser.pane.unsupported") {
             setState("unsupported", ref.server.id, true)
@@ -410,24 +423,7 @@ export function createModel(ctx: SetupContext<typeof definition>) {
     if (current) openURL(session, workspaceFileURL(current, path))
   }
 
-  // HTML the pane can load opens as a browser tab. Palette results and comment chips name files to
-  // edit, so they keep opening file tabs.
-  const target = (link: Link) => {
-    if (link.exact || link.origin || !link.session) return
-    const view = sessions.current()
-
-    if (view?.key !== link.session.key) return
-    const current = files(view)
-
-    if (!current) return
-    const path = resolveLink(current, link.href, link.base)
-
-    if (!path || !isHtml(path) || !canOpen(view, path)) return
-
-    return { view, path }
-  }
-
-  // The agent's browser.preview tool: the link router picks the browser for HTML, the file panel otherwise. Only the
+  // The agent's browser.preview tool: the file extension opens HTML in the browser, other files in the file panel. Only the
   // session's screen resolves workspace paths, so a preview for a session that is not on screen waits for it.
   const preview = (entry: Live, path: string) => {
     const view = sessions.current()
@@ -472,18 +468,6 @@ export function createModel(ctx: SetupContext<typeof definition>) {
       recorded.clear()
       history.set({ visits: [] })
     },
-    /** The page asking for the address field with its shortcut. */
-    onAddress(session: Session, listener: (tabID: Browser.TabID) => void) {
-      const set = addressed.get(session.key) ?? new Set()
-      set.add(listener)
-      addressed.set(session.key, set)
-
-      return () => {
-        set.delete(listener)
-
-        if (!set.size) addressed.delete(session.key)
-      }
-    },
     pending,
     /**
      * Tab IDs to list in the side panel: the desktop's inventory, limited to tabs stored in the strip. Until the first
@@ -515,17 +499,16 @@ export function createModel(ctx: SetupContext<typeof definition>) {
 
       if (item) command(session, { type: "tabs.close", tabID: item.id })
     },
+    /** Closes a tab through the strip, as its close button does, so ⌘⇧T can reopen it. */
+    close(session: SessionRef, tabID: string) {
+      if (layout.state(key(tabID), session) === "closed") return this.closeTab(session, tabID)
+      layout.close(key(tabID), session)
+    },
     focusTab(session: Session, tabID: string) {
       const item = tab(session, tabID)
 
       if (item && item.id !== attachment(session)?.browser?.focusedTabID)
         command(session, { type: "tabs.focus", tabID: item.id })
-    },
-    match: (link: Link) => !!target(link),
-    openLink(link: Link) {
-      const found = target(link)
-
-      if (found) openFile(found.view, found.path)
     },
     /** The page's element picker starting, stopping, or picking an element. */
     onInspect(session: Session, listener: (event: InspectEvent) => void) {

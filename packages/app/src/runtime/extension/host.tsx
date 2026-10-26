@@ -1,3 +1,4 @@
+import { abort } from "@opencode/util/abort"
 import {
   batch,
   catchError,
@@ -21,9 +22,8 @@ import {
 } from "solid-js"
 import { createStore } from "solid-js/store"
 import { Predicate } from "effect"
-import { resolveTemplate } from "@solid-primitives/i18n"
 import { useDialog } from "@opencode/ui/context/dialog"
-import { pluralCategory } from "@opencode/ui/context/i18n"
+import { pluralCategory, resolveTemplate } from "@opencode/ui/context/i18n"
 import {
   ExtensionContext,
   LifetimeContext,
@@ -36,6 +36,7 @@ import {
   type Contract,
   type Definition,
   type Dialogs,
+  type Link,
   type Links,
   type Messages,
   type Persisted,
@@ -87,10 +88,10 @@ export type HostApiFactories = {
   readonly [K in Exclude<keyof HostApis, "links" | "dialogs">]: HostApiFactory<HostApis[K]>
 }
 
-export type ExtensionStatus = "loading" | "active" | "failed" | "disabled" | "blocked"
+type ExtensionStatus = "loading" | "active" | "failed" | "disabled" | "blocked"
 
 /** The last error an extension raised: in its setup or an effect, or while one of its contributions rendered. */
-export type ExtensionFailure = { readonly phase: "setup" | "render"; readonly error: string }
+type ExtensionFailure = { readonly phase: "setup" | "render"; readonly error: string }
 
 type Absent = Exclude<Live<never>, { readonly status: "active" }>
 
@@ -297,14 +298,17 @@ function createHost(input: HostInput) {
 
   const list = <T,>(registry: Registry<T>) => items(registry).map((item) => item.value)
 
+  const pickLinkHandler = (link: Link) =>
+    list(LinkHandler)
+      .filter((item) => item.match(link))
+      .reduce<LinkHandler | undefined>(
+        (best, item) => (!best || (item.priority ?? 0) > (best.priority ?? 0) ? item : best),
+        undefined,
+      )
+
   const links: Links = {
     open(link) {
-      const handler = untrack(() => list(LinkHandler))
-        .filter((item) => item.match(link))
-        .reduce<LinkHandler | undefined>(
-          (best, item) => (!best || (item.priority ?? 0) > (best.priority ?? 0) ? item : best),
-          undefined,
-        )
+      const handler = untrack(() => pickLinkHandler(link))
 
       if (!handler) return false
 
@@ -312,6 +316,8 @@ function createHost(input: HostInput) {
 
       return true
     },
+    // Markdown asks from inside its render effect; untracked so a session or screen switch never reruns it.
+    exists: (link) => untrack(() => pickLinkHandler(link)?.exists?.(link) ?? false),
   }
 
   const dialog = useDialog()
@@ -330,7 +336,7 @@ function createHost(input: HostInput) {
         // Each handle names its own dialog, so it never closes one another extension or instance opened. Closing a
         // dialog that still waits for the app interface, or for its deferred open, cancels it.
         const close = () => {
-          opening.abort()
+          abort(opening)
           waiting.cancel()
           dialog.close(id)
         }
@@ -744,7 +750,7 @@ function createHost(input: HostInput) {
       },
       preload: (session) => sessions.forEach((store) => store.get(session)),
       dispose() {
-        controller.abort()
+        abort(controller)
         // One batch: every contribution and contract of the extension disappears in the same frame.
         batch(() => {
           Array.from(cleanups).reverse().forEach(release)

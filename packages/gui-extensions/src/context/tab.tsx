@@ -1,16 +1,16 @@
-import { createMemo, on, onCleanup, For, Show } from "solid-js"
+import { createMemo, on, onCleanup, onMount, For, Show } from "solid-js"
 import type { JSX } from "solid-js"
 import { checksum } from "@opencode/util/encode"
 import { Icon } from "@opencode/ui/icon"
 import { Button } from "@opencode/ui/button"
 import { Accordion } from "@opencode/ui/accordion"
 import { StickyAccordionHeader } from "@opencode/ui/sticky-accordion-header"
-import { ScrollView } from "@opencode/ui/scroll-view"
 import { showToast } from "@opencode/ui/toast"
 import { useI18n } from "@opencode/ui/context/i18n"
 import { File } from "@opencode/session-ui/file"
 import { Markdown } from "@opencode/session-ui/markdown"
 import type { SessionMessageInfo } from "@opencode/client/promise"
+import { lastAssistantWithUsage } from "@opencode/client/solid"
 import { createKeyed, useExtension, type MountedSession } from "../sdk"
 import { catalogModel, syncCatalog } from "./catalog"
 import { fetchSessionExport, sessionExportFilename } from "./export"
@@ -108,10 +108,11 @@ export default function SessionContextTab(props: { session: MountedSession }) {
       }),
   )
 
+  // Same step as the TUI and the header button: after the last completed compaction and before an undo boundary.
   const context = createMemo(() => {
-    const message = messages().findLast((item) => item.type === "assistant" && !!item.tokens)
+    const message = lastAssistantWithUsage(messages(), info()?.revert?.messageID)
 
-    if (message?.type !== "assistant" || !message.tokens) return
+    if (!message) return
     const entry = catalogModel(props.session, message.model)
 
     const total =
@@ -135,9 +136,8 @@ export default function SessionContextTab(props: { session: MountedSession }) {
 
   const formatter = createMemo(() => createSessionContextFormatter(i18n.locale()))
 
-  const cost = createMemo(() => {
-    return usd().format(info()?.cost ?? 0)
-  })
+  // A root session's cost includes its subagent sessions, as in the TUI.
+  const cost = createMemo(() => usd().format(props.session.id ? data().session.cost(props.session.id) : 0))
 
   const counts = createMemo(() => {
     const all = messages()
@@ -281,11 +281,13 @@ export default function SessionContextTab(props: { session: MountedSession }) {
   })
 
   return (
-    <ScrollView
-      class="@container h-full"
-      viewportRef={(el) => {
+    <div
+      class="@container h-full overflow-y-auto"
+      data-scrollable
+      ref={(el) => {
         scroll = el
-        restoreScroll()
+        // The ref runs before the content renders into the element.
+        onMount(restoreScroll)
       }}
       onScroll={handleScroll}
     >
@@ -298,7 +300,7 @@ export default function SessionContextTab(props: { session: MountedSession }) {
           {(prompt) => (
             <div class="flex flex-col gap-2">
               <div class="text-12-regular text-text-weak">{ctx.t("systemPrompt.title")}</div>
-              <div class="border border-border-base rounded-md bg-surface-base px-3 py-2">
+              <div class="border border-v2-border-border-base rounded-md bg-surface-base px-3 py-2">
                 <Markdown text={prompt()} class="text-12-regular" />
               </div>
             </div>
@@ -325,7 +327,7 @@ export default function SessionContextTab(props: { session: MountedSession }) {
           </Accordion>
         </div>
       </div>
-    </ScrollView>
+    </div>
   )
 }
 

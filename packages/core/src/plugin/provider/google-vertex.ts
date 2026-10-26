@@ -14,7 +14,7 @@ const decodeADCFile = Schema.decodeUnknownOption(
   Schema.fromJsonString(Schema.Struct({ quota_project_id: Schema.optional(Schema.String) })),
 )
 
-function resolveProject(options: Record<string, any>) {
+function resolveProject(options: Record<string, unknown>) {
   // models.dev advertises GOOGLE_VERTEX_PROJECT for Vertex, while Google SDKs
   // and ADC examples commonly use the broader Google Cloud project aliases.
   const project =
@@ -26,7 +26,7 @@ function resolveProject(options: Record<string, any>) {
   return typeof project === "string" ? project : undefined
 }
 
-function resolveLocation(options: Record<string, any>) {
+function resolveLocation(options: Record<string, unknown>) {
   const location =
     options.location ??
     process.env.GOOGLE_VERTEX_LOCATION ??
@@ -58,7 +58,13 @@ export const GoogleVertexPlugin = define({
     const read = (file: string) => fs.readFileStringSafe(file).pipe(Effect.orElseSucceed(() => undefined))
     // Same lookup as gcloud itself. Only project IDs are read; nothing here contacts Google.
     const gcloud =
-      process.env.CLOUDSDK_CONFIG ??
+      (process.env.CLOUDSDK_CONFIG
+        ? process.env.CLOUDSDK_CONFIG === "~"
+          ? Global.Path.home
+          : process.env.CLOUDSDK_CONFIG.startsWith("~/")
+            ? path.join(Global.Path.home, process.env.CLOUDSDK_CONFIG.slice(2))
+            : process.env.CLOUDSDK_CONFIG
+        : undefined) ??
       (process.platform === "win32" && process.env.APPDATA
         ? path.join(process.env.APPDATA, "gcloud")
         : path.join(Global.Path.home, ".config", "gcloud"))
@@ -197,10 +203,11 @@ export const GoogleVertexPlugin = define({
         const location = resolveLocation(settings) ?? "global"
         for (const model of models.list(item.provider.id)) {
           if (typeof model.settings?.baseURL !== "string") continue
+          const baseURL = replaceVertexVars(model.settings.baseURL, project, location)
           models.update(item.provider.id, model.id, (draft) => {
             draft.settings = {
               ...draft.settings,
-              baseURL: replaceVertexVars(String(draft.settings?.baseURL), project, location),
+              baseURL,
             }
           })
         }

@@ -1,12 +1,15 @@
 import { expect } from "bun:test"
 import path from "path"
-import { Clock, Deferred, Effect } from "effect"
+import { Clock, Deferred, Effect, Fiber, Stream } from "effect"
 import { TestClock } from "effect/testing"
 import { Command } from "@opencode/core/command"
 import { Bus } from "@opencode/core/bus"
 import { Credential } from "@opencode/core/credential"
 import { Integration } from "@opencode/core/integration"
 import { Plugin } from "@opencode/core/plugin"
+import { PluginHost } from "@opencode/core/plugin/host"
+import { Rpc } from "@opencode/core/rpc"
+import { Event } from "@opencode/schema/config"
 import { PluginModule } from "@opencode/core/plugin/module"
 import { Session } from "@opencode/core/session"
 import { SessionSchema } from "@opencode/core/session/schema"
@@ -606,5 +609,59 @@ it.effect("refreshes expired OAuth credentials through the context during activa
       }),
     ).toEqual(refreshed)
     expect(refreshes).toEqual([expired])
+  }),
+)
+
+it.effect("activates a saved credential through the context", () =>
+  Effect.gen(function* () {
+    const plugins = yield* Plugin.Service
+    const credentials = yield* Credential.Service
+    const integrations = yield* Integration.Service
+    const integrationID = Integration.ID.make("activate-fixture")
+    const first = yield* credentials.create({
+      integrationID,
+      label: "First",
+      value: Credential.Key.make({ type: "key", key: "first" }),
+    })
+    yield* credentials.create({
+      integrationID,
+      label: "Second",
+      value: Credential.Key.make({ type: "key", key: "second" }),
+    })
+    expect(yield* integrations.connection.active(integrationID)).toMatchObject({ label: "Second" })
+
+    yield* plugins.activate([
+      {
+        ...fromPromise({
+          id: "activate-credential",
+          async setup(ctx) {
+            await ctx.credential.activate({ credentialID: first.id })
+          },
+        }),
+        revision: "1",
+      },
+    ])
+    yield* plugins.awaitActivation
+
+    expect(yield* plugins.list()).toMatchObject([{ id: "activate-credential", state: { status: "active" } }])
+    expect(yield* integrations.connection.active(integrationID)).toMatchObject({ id: first.id, label: "First" })
+  }),
+)
+
+it.effect("host event subscriptions deliver requested rpc types and ignore unknown types", () =>
+  Effect.gen(function* () {
+    const bus = yield* Bus.Service
+    const host = yield* PluginHost.make(yield* Plugin.Service)
+    const fiber = yield* host.event
+      // @ts-expect-error untyped JavaScript plugins can still pass unknown type names
+      .subscribe({ types: ["rpc.test.ping", "test.unknown"] })
+      .pipe(Stream.take(1), Stream.runCollect, Effect.forkScoped({ startImmediately: true }))
+
+    yield* bus.publish(Event.Updated, {})
+    yield* bus.publish(Rpc.eventDefinition("rpc.test.ping"), { value: 1 })
+
+    expect(Array.from(yield* Fiber.join(fiber)).map((event) => [event.type, event.data])).toEqual([
+      ["rpc.test.ping", { value: 1 }],
+    ])
   }),
 )

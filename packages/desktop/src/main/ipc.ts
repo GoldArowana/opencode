@@ -2,7 +2,7 @@ export * as Ipc from "./ipc"
 
 import { app, BrowserWindow, MessageChannelMain } from "electron"
 import { Effect, Layer } from "effect"
-import { RpcServer } from "effect/unstable/rpc"
+import { RpcServer } from "effect/rpc"
 import { DesktopRpcs } from "../shared/ipc-rpc"
 import { DragCancelEvent, IpcTransportPort } from "../shared/ipc-transport"
 import { Extensions } from "./extension"
@@ -59,6 +59,11 @@ export const registerIpcHandlers = Effect.gen(function* () {
 
   const wire = (win: BrowserWindow) => {
     win.webContents.on("before-input-event", (_event, input) => {
+      // Ctrl+R renames the session in the renderer, so the default menu's Reload must not take it.
+      win.webContents.setIgnoreMenuShortcuts(
+        input.control && !input.meta && !input.shift && !input.alt && input.key.toLowerCase() === "r",
+      )
+
       if (input.type !== "keyDown" || input.key !== "Escape") return
       win.webContents.send(DragCancelEvent)
     })

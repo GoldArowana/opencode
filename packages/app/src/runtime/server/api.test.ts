@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test"
 import type { SessionNotFoundError } from "@opencode/client/promise"
 import { Data } from "effect"
-import { authFromToken, authTokenFromCredentials, createApiForServer } from "./api"
+import { authFromToken, authTokenFromCredentials, createApiForServer, fileStreamUrl } from "./api"
 
 test.each([
   [btoa("opencode:secret"), { password: "secret" }],
@@ -80,4 +80,12 @@ test("concurrent deletions retain their own response status and request options"
   writer.close()
   release.resolve()
   await expect(first).rejects.toMatchObject({ cause: { status: 401, body: { sessionID: "ses_same" } } })
+})
+
+test("fileStreamUrl never puts a credential in a media URL", () => {
+  const input = { path: "clips/final cut.mp4", directory: "/work/app" }
+  expect(fileStreamUrl({ url: "http://127.0.0.1:4096", password: "secret" }, input)).toBeUndefined()
+  expect(fileStreamUrl({ url: "http://127.0.0.1:4096" }, input)).toBe(
+    "http://127.0.0.1:4096/api/fs/read/clips/final%20cut.mp4?location%5Bdirectory%5D=%2Fwork%2Fapp",
+  )
 })

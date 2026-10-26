@@ -47,11 +47,21 @@ export const PaneEvent = Schema.Union([
   Schema.Struct({
     type: Schema.Literal("page"),
     tabID: Browser.TabID,
-    icon: Schema.optionalKey(detail(MAX_ICON_URL).check(Schema.isStartsWith("data:image/"))),
+    icon: Schema.optionalKey(detail(MAX_ICON_URL).check(Schema.isStartingWith("data:image/"))),
     zoom: Schema.Finite.check(Schema.isBetween({ minimum: 0.25, maximum: 5 })),
   }),
-  // The page asked for the address field, with the platform's address shortcut.
-  Schema.Struct({ type: Schema.Literal("address"), tabID: Browser.TabID }),
+  // The user put keyboard focus in the page, outside the window's own document.
+  Schema.Struct({ type: Schema.Literal("focused"), tabID: Browser.TabID }),
+  // The page handed a browser or shell shortcut to the window, which runs it as its own key press.
+  Schema.Struct({
+    type: Schema.Literal("shortcut"),
+    key: text(64),
+    code: detail(64),
+    ctrl: Schema.Boolean,
+    meta: Schema.Boolean,
+    shift: Schema.Boolean,
+    alt: Schema.Boolean,
+  }),
 ])
 
 export type PaneEvent = typeof PaneEvent.Type
@@ -67,7 +77,7 @@ export const BrowserPane = Ipc.define({
       input: Schema.Struct({
         binding,
         server: text(16_384),
-        session: text(256).check(Schema.isStartsWith("ses")),
+        session: text(256).check(Schema.isStartingWith("ses")),
         restore: Schema.optionalKey(Browser.State),
       }),
     },

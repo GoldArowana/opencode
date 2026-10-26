@@ -10,10 +10,11 @@ import {
   type ParentProps,
   type Signal,
 } from "solid-js"
-import { createStore } from "solid-js/store"
+import { createStore, produce } from "solid-js/store"
 import { Icon } from "@opencode/ui/icon"
 import { encodeFilePath, getFilename } from "@opencode/util/path"
 import {
+  Command,
   createKeyed,
   bindExtension,
   LinkHandler,
@@ -24,10 +25,12 @@ import {
   usePanel,
   type Files,
   type LineRange,
+  type Link,
   type OpenOptions,
   type PanelTab,
   type MountedSession,
   type SessionScreen,
+  type ServerRef,
   type Setup,
   onIdle,
 } from "../sdk"
@@ -43,25 +46,37 @@ import tabStyles from "./tabs.css?inline"
 
 const OPEN = "open"
 
+const isLauncher = (id: string) => id === OPEN || id.startsWith(`${OPEN}:`)
+
 const GROUP = "browser"
 
 const TABPANEL = "session-side-panel-file-browser-tabpanel"
 
 const HANDOFF_SESSIONS = 40
 
+const FILTER_SESSIONS = 40
+
+const DEFAULT_LINE_HEIGHT = 24
+
 type Handoff = { sessions: Record<string, Record<string, LineRange | null>> }
 
 type StyleLoad = { loaded?: Promise<void> }
+
+type LinkCheck = { result: boolean | Promise<boolean>; expires: number; known?: true }
 
 const setup: Setup<typeof File> = (ctx) => {
   const sessions = ctx.sessions
   const layout = ctx.layout
   const storage = ctx.storage
   const desktop = ctx.desktop
-  const tree = ctx.stores.tree
   const [handoff, setHandoff] = storage.memory<Handoff>("handoff", { initial: { sessions: {} } })
   const preference = desktop ? ctx.stores.app : undefined
   const [request, setRequest] = createStore<{ app?: OpenApp }>({})
+
+  const [filters, setFilters] = createStore<Record<string, { text: string; browsing: boolean } | undefined>>({})
+
+  const revealListeners = new Map<string, Set<() => void>>()
+  let clickController: AbortController | undefined
 
   // Tab objects per session screen, which stays while it routes another session, reused so neither strip updates nor a
   // session switch rebuild a trigger. `close` prunes them.
@@ -90,27 +105,87 @@ const setup: Setup<typeof File> = (ctx) => {
     return state === "active" || state === "visible"
   }
 
+  const updateFilter = (session: string, patch: { text?: string; browsing?: boolean }) => {
+    setFilters(
+      produce((draft) => {
+        const current = draft[session]
+        const text = patch.text ?? current?.text ?? ""
+        const browsing = patch.browsing ?? current?.browsing ?? false
+        delete draft[session]
+
+        if (!text && !browsing) return
+        draft[session] = { text, browsing }
+        const keys = Object.keys(draft)
+
+        keys.slice(0, Math.max(0, keys.length - FILTER_SESSIONS)).forEach((item) => delete draft[item])
+      }),
+    )
+  }
+
   // Opens on the session screen, whose file model serves the routed session `session` is.
   const open = (session: MountedSession, path: string, options?: OpenOptions) => {
     const screen = ctx.screen.current()
 
     if (!screen) return
 
+    // Not batched: the mobile tab strip must register the new tab before it leaves the browser, or Kobalte falls back
+    // to the first tab and reselects it.
     layout.open(key(screen.file, path), session, options)
+    updateFilter(session.key, { browsing: false })
     void screen.file.sync(path)
+  }
+
+  const applySelection = (session: MountedSession, files: Files, path: string, selection: LineRange | undefined) => {
+    if (!selection || artifactKind(path) !== "text") return
+
+    const tabKey = key(files, path)
+    const existing = layout.scroll.get(session, tabKey)
+
+    files.selection.set(path, selection)
+    layout.scroll.set(session, tabKey, {
+      x: existing?.x ?? 0,
+      y: Math.max(0, (selection.start - 4) * DEFAULT_LINE_HEIGHT),
+    })
+    shared.reveal.run(session.key, path)
+  }
+
+  // Reuses the selected launcher; otherwise wide screens add another one beside the open tabs, so several can stay
+  // open. Narrow screens never store a launcher, so they keep the one.
+  const openPicker = (session: MountedSession, query: string, options?: OpenOptions & { another?: boolean }) => {
+    const selected = options?.another
+      ? undefined
+      : layout.stored(session).find((id) => isLauncher(id) && active(session, id))
+
+    batch(() => {
+      updateFilter(session.key, { text: query, browsing: true })
+
+      if (selected || layout.narrow())
+        layout.open(`file:${selected ?? OPEN}`, session, { tab: "preview", background: options?.background })
+      else layout.open(`file:${OPEN}:${crypto.randomUUID()}`, session, { tab: "select" })
+
+      if (!options?.background && layout.narrow() && !layout.side.opened(session)) layout.side.toggle(session)
+    })
+
+    if (options?.background) return
+
+    queueMicrotask(() => {
+      const element = shared.filter.element
+
+      if (element?.isConnected) return element.focus()
+
+      shared.filter.pending = true
+    })
   }
 
   const shared: FileShared = {
     changes: ctx.uses.changes,
     browser: ctx.uses.browser,
-    tree: {
-      tab: () => tree.value.tab,
-      setTab: (tab) =>
-        tree.update((draft) => {
-          draft.tab = tab
-        }),
+    filter: {
+      get: (session) => filters[session]?.text ?? "",
+      set: (session, value) => updateFilter(session, { text: value }),
+      browsing: (session) => filters[session]?.browsing ?? false,
+      setBrowsing: (session, value) => updateFilter(session, { browsing: value }),
     },
-    filter: {},
     installed: new Map(),
     app: preference && {
       current: () => preference.value.app,
@@ -134,6 +209,23 @@ const setup: Setup<typeof File> = (ctx) => {
           keys.slice(0, Math.max(0, keys.length - HANDOFF_SESSIONS)).forEach((item) => delete draft.sessions[item])
         }),
     },
+    reveal: {
+      register(session, path, run) {
+        const targetKey = `${session}\n${path}`
+        const set = revealListeners.get(targetKey) ?? new Set()
+        set.add(run)
+        revealListeners.set(targetKey, set)
+
+        return () => {
+          set.delete(run)
+
+          if (set.size === 0) revealListeners.delete(targetKey)
+        }
+      },
+      run(session, path) {
+        revealListeners.get(`${session}\n${path}`)?.forEach((fn) => fn())
+      },
+    },
     active,
     open,
   }
@@ -155,23 +247,23 @@ const setup: Setup<typeof File> = (ctx) => {
 
   const FileBrowser = lazy(() => styled(import("./browser")))
   const MobileFiles = lazy(() => styled(import("./mobile")))
-  const Sidebar = lazy(() => styled(import("./sidebar")))
-  const Tree = lazy(() => styled(import("./tree-v2")))
+  const Tree = lazy(() => styled(import("./pierre-tree")))
   const List = lazy(() => styled(import("./list")))
 
   onCleanup(
     onIdle(() => {
+      void import("./pierre-tree")
       void FileBrowser.preload()
-      void Sidebar.preload()
       void Tree.preload()
       void List.preload()
+      void import("./resolve-link")
 
       if (layout.narrow()) void MobileFiles.preload()
     }),
   )
 
-  const launcher: PanelTab = {
-    id: OPEN,
+  const launcher = (id: string): PanelTab => ({
+    id,
     get title() {
       return ctx.t("command.open")
     },
@@ -182,11 +274,10 @@ const setup: Setup<typeof File> = (ctx) => {
       </div>
     ),
     draggable: false,
-    closable: "hover",
     transient: true,
     group: GROUP,
     dom: { panel: TABPANEL },
-  }
+  })
 
   const fileTab = (files: Files, id: string): PanelTab => {
     const path = () => fileTabPath(files, id)
@@ -233,16 +324,14 @@ const setup: Setup<typeof File> = (ctx) => {
     },
     list(input) {
       return input.open.flatMap((id) => {
-        if (id === OPEN) return [launcher]
-
-        if (!isFileTab(id)) return []
+        if (!isLauncher(id) && !isFileTab(id)) return []
 
         const cache = tabsOf(input.screen)
         const existing = cache.get(id)
 
         if (existing) return [existing]
 
-        const created = fileTab(input.screen.file, id)
+        const created = isLauncher(id) ? launcher(id) : fileTab(input.screen.file, id)
 
         cache.set(id, created)
 
@@ -251,6 +340,8 @@ const setup: Setup<typeof File> = (ctx) => {
     },
     close(input) {
       tabs.get(input.screen)?.delete(input.tab.id)
+
+      if (isFileTab(input.tab.id)) input.screen.file.unwatch(fileTabPath(input.screen.file, input.tab.id))
     },
     render: (props) => {
       const panel = usePanel()
@@ -272,37 +363,48 @@ const setup: Setup<typeof File> = (ctx) => {
       if (!isFileTab(input.tab.id)) return
 
       focused.set(input.screen, input.tab.id)
-      void input.screen.file.sync(fileTabPath(input.screen.file, input.tab.id))
-
-      // A restored file tab keeps the tree tab the user left, e.g. Changes across a reload.
-      if (!input.restored && tree.value.tab === "changes") shared.tree.setTab("all")
+      void input.screen.file.sync(fileTabPath(input.screen.file, input.tab.id), { silent: true })
     },
   })
 
-  ctx.add(MenuItem, {
-    menu: "session.panel",
-    id: "open",
-    get title() {
-      return ctx.t("command.open")
-    },
-    icon: "file-tree",
-    keybind: "file.open",
-    order: 10,
-    run() {
-      const session = sessions.current()
+  const browse = () => {
+    const session = sessions.current()
 
-      if (!session) return
+    if (session) openPicker(session, shared.filter.get(session.key))
+  }
 
-      layout.open(`file:${OPEN}`, session, { tab: "preview" })
-      queueMicrotask(() => {
-        const element = shared.filter.element
+  const mac = /(Mac|iPhone|iPad)/.test(navigator.platform)
 
-        if (element?.isConnected) return element.focus()
+  ctx.add(
+    Command,
+    (): Command => ({
+      id: "browse",
+      title: ctx.t("command.open"),
+      group: ctx.t("command.category.view"),
+      bind: mac ? "ctrl+meta+p" : "ctrl+alt+p",
+      editable: true,
+      enabled: !!sessions.current(),
+      run: browse,
+    }),
+  )
 
-        shared.filter.pending = true
-      })
-    },
-  })
+  // A new tab always offers another launcher, however many are open.
+  ctx.add(
+    MenuItem,
+    (): MenuItem => ({
+      menu: "session.panel",
+      id: "open",
+      title: ctx.t("command.open"),
+      icon: "file-tree",
+      keybind: "file.browse",
+      order: 30,
+      run: () => {
+        const session = sessions.current()
+
+        if (session) openPicker(session, "", { another: true })
+      },
+    }),
+  )
 
   const OpenInAppButton = lazy(() => import("./open-in-app"))
 
@@ -356,17 +458,6 @@ const setup: Setup<typeof File> = (ctx) => {
     }),
   })
 
-  ctx.add(Slot, {
-    at: "session.panel.sidebar",
-    render: (input) => (
-      <FileProvider>
-        <Suspense>
-          <Sidebar session={input.session} screen={input.screen} />
-        </Suspense>
-      </FileProvider>
-    ),
-  })
-
   // The review panel lists its changed files with the browser's tree; it renders under this extension, on the
   // session screen's file model.
   ctx.provide(FileTree, {
@@ -378,6 +469,7 @@ const setup: Setup<typeof File> = (ctx) => {
             screen={props.screen}
             allowed={props.allowed}
             kinds={props.kinds}
+            labels={props.labels}
             draggable={false}
             active={props.active}
             onFileClick={(node) => props.onFileClick(node.path)}
@@ -407,10 +499,8 @@ const setup: Setup<typeof File> = (ctx) => {
    * otherwise absolute. Relative links resolve against `base`; ones that climb past the root
    * become absolute too, so a `../../shared/report.pdf` still opens.
    */
-  const resolve = (files: Files, href: string, base?: string) => {
+  const resolve = (files: Files, value: string, base?: string) => {
     const root = files.root.replaceAll("\\", "/").replace(/\/+$/, "")
-    // Agents cite locations as path:line or path:line:col; the file is what opens.
-    const value = href.replaceAll("\\", "/").replace(/:\d+(?::\d+)?$/, "")
 
     if (/^[a-z]:\//i.test(value) || value.startsWith("/")) return files.resolve(value)
 
@@ -424,15 +514,89 @@ const setup: Setup<typeof File> = (ctx) => {
     return files.resolve(resolveArtifactPath(dir, value) ?? value)
   }
 
+  // Screens survive tab switches, unlike Markdown and MountedSession objects. Weak client keys also drop results
+  // from an old server connection without retaining its controller.
+  const linkChecks = new WeakMap<SessionScreen, WeakMap<ServerRef["client"], Map<string, LinkCheck>>>()
+
+  // Messages style a path as a link only when this says the file exists.
+  const linkExists = (link: Link): boolean | Promise<boolean> => {
+    const session = sessions.current()
+    const screen = ctx.screen.current()
+    const files = screen?.file
+
+    if (!session || !screen || !files || (link.session && link.session.key !== session.key)) return false
+
+    const clients = linkChecks.get(screen) ?? new WeakMap<ServerRef["client"], Map<string, LinkCheck>>()
+    linkChecks.set(screen, clients)
+    const client = session.server.client
+    const checks = clients.get(client) ?? new Map<string, LinkCheck>()
+    clients.set(client, checks)
+    const root = files.root
+    const key = JSON.stringify([session.key, root, link.base ?? null, link.href])
+    const cached = checks.get(key)
+
+    if (cached && cached.expires > Date.now()) return cached.known ?? cached.result
+
+    const current = () =>
+      !ctx.signal.aborted &&
+      sessions.current()?.key === session.key &&
+      files.root === root &&
+      session.server.client === client
+
+    const pending = import("./resolve-link")
+      .then(async ({ checkFileLinkExists, parseFileLink }) => {
+        if (!current()) return false
+
+        // A link in a previewed document opens relative to it, so only that path counts.
+        const path = parseFileLink(link.href).path
+
+        const direct =
+          link.base === undefined || path.startsWith("//") || path.startsWith("~")
+            ? undefined
+            : resolve(files, path, link.base)
+
+        const exists = await (link.base === undefined
+          ? checkFileLinkExists({ files, href: link.href, signal: ctx.signal })
+          : direct
+            ? files.exists(direct)
+            : false)
+
+        if (!current()) return false
+
+        if (checks.get(key)?.result === pending)
+          checks.set(key, { result: exists, expires: Date.now() + (exists ? 60_000 : 5_000) })
+
+        return exists
+      })
+      .catch(() => false)
+      .finally(() => {
+        // Aborted, failed or no-longer-current checks are retryable, not cached negatives.
+        if (checks.get(key)?.result === pending) checks.delete(key)
+      })
+
+    // Revalidate known paths without bringing back their plain-code flash. Expired negatives await a fresh check.
+    const known = cached?.result === true ? true : undefined
+    checks.delete(key)
+    checks.set(key, { result: pending, expires: Infinity, known })
+
+    while (checks.size > 512) checks.delete(checks.keys().next().value!)
+
+    return known ?? pending
+  }
+
   // Opens files the agent references as side panel tabs, inside or outside the workspace, or as
   // a browser tab for HTML when the desktop can load the file directly.
   ctx.add(LinkHandler, {
     match: () => true,
+    exists: linkExists,
     open(link) {
       const session = sessions.current()
-      const files = ctx.screen.current()?.file
+      const screen = ctx.screen.current()
+      const files = screen?.file
 
-      if (!session || !files || (link.session && link.session.key !== session.key)) return
+      if (!session || !screen || !files || (link.session && link.session.key !== session.key)) return
+
+      clickController?.abort()
 
       // A known workspace file (the palette, a file comment) opens at once with every file listed.
       if (link.exact || link.origin === "file") {
@@ -440,44 +604,88 @@ const setup: Setup<typeof File> = (ctx) => {
 
         if (!path) return
 
-        batch(() => {
-          open(session, path, { background: link.background })
-          shared.tree.setTab("all")
-        })
+        open(session, path, { background: link.background })
 
         return
       }
 
-      const path = resolve(files, link.href, link.base)
+      const controller = new AbortController()
+      clickController = controller
+      const signal = AbortSignal.any([ctx.signal, controller.signal])
+      const sessionKey = session.key
 
-      if (!path) return
+      const stillCurrent = () => {
+        const current = sessions.current()
 
-      // The browser pane shows HTML it can load. While it is pending or off, the file opens as a tab instead.
-      const pane = ctx.uses.browser()
-
-      if (artifactKind(path) === "html" && pane.status === "active" && pane.value.canOpen(session, path)) {
-        pane.value.open(session, workspaceFileUrl(files.root, path))
-
-        return
+        return !signal.aborted && current?.key === sessionKey && ctx.screen.current() === screen ? current : undefined
       }
 
-      // Inline paths are guessed from text, so confirm the file exists before a tab appears for it.
-      // Always reread: V2 publishes no workspace file change events, so a cached copy can be stale.
-      void files.sync(path, { force: true }).then(() => {
-        if (!files.get(path)?.loaded) return
+      const openResolvedFile = (targetPath: string, selection?: LineRange) => {
+        const routed = stillCurrent()
 
-        batch(() => {
-          layout.open(key(files, path), session, { background: link.background })
+        if (!routed) return Promise.resolve()
 
-          // A tapped link switches the narrow-screen view; the side region still opens for when the window is wide.
-          if (layout.narrow() && !layout.side.opened(session)) layout.side.toggle(session)
+        // The browser pane shows HTML it can load. While it is pending or off, the file opens as a tab instead.
+        const pane = ctx.uses.browser()
+
+        if (artifactKind(targetPath) === "html" && pane.status === "active" && pane.value.canOpen(routed, targetPath)) {
+          pane.value.open(routed, workspaceFileUrl(files.root, targetPath))
+
+          return Promise.resolve()
+        }
+
+        // Confirm the file exists before a tab appears for it; a file deleted since its link rendered shows the load
+        // error. Always reread: a cached copy can be stale.
+        return files.sync(targetPath, { force: true }).then(() => {
+          const latest = stillCurrent()
+
+          if (!latest || !files.get(targetPath)?.loaded) return
+
+          batch(() => {
+            applySelection(latest, files, targetPath, selection)
+            layout.open(key(files, targetPath), latest, { background: link.background })
+
+            // A tapped link switches the narrow-screen view; the side region still opens for when the window is wide.
+            if (layout.narrow() && !layout.side.opened(latest)) layout.side.toggle(latest)
+          })
+          // After the batch, as in `open`: the mobile tab strip registers the tab before it leaves the browser.
+          updateFilter(latest.key, { browsing: false })
         })
-      })
+      }
+
+      void (async () => {
+        const { findFileLink, isAbsoluteLink, parseFileLink } = await import("./resolve-link")
+
+        if (!stillCurrent()) return
+
+        const parsed = parseFileLink(link.href)
+        const direct = resolve(files, parsed.path, link.base)
+
+        if (!direct) return
+
+        // Absolute paths, links written relative to a document, and agent previews name one exact file.
+        if (isAbsoluteLink(parsed.path) || link.base !== undefined || link.background) {
+          await openResolvedFile(direct, parsed.selection)
+
+          return
+        }
+
+        const target = await findFileLink({ files, path: parsed.path, signal })
+        const latest = stillCurrent()
+
+        if (!latest) return
+
+        if (target?.kind === "picker") {
+          openPicker(latest, target.query)
+
+          return
+        }
+
+        // With no match, the literal path still covers files the search index skips, such as an ignored `.env`.
+        await openResolvedFile(target?.path ?? direct, parsed.selection)
+      })()
     },
   })
-
-  // Review reveals a change: the tree shows the changed files.
-  createKeyed(ctx.uses.changes, (changes) => onCleanup(changes.onReveal(() => shared.tree.setTab("changes"))))
 
   // A new workspace directory drops loaded files; reload the selected file tab.
   const root = createMemo<string | undefined>((previous) => ctx.screen.current()?.file.root ?? previous)
@@ -492,7 +700,7 @@ const setup: Setup<typeof File> = (ctx) => {
 
     const id = focused.get(screen)
 
-    if (id && active(session, id)) void screen.file.sync(fileTabPath(screen.file, id), { force: true })
+    if (id && active(session, id)) void screen.file.sync(fileTabPath(screen.file, id), { force: true, silent: true })
   })
 }
 

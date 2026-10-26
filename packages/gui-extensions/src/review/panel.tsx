@@ -25,6 +25,7 @@ import type Review from "./index"
 import {
   applyFileListKeyDown,
   filterReviewFiles,
+  isReviewFolder,
   reviewDiffKinds,
   reviewDiffNeedsLoad,
   sortReviewPaths,
@@ -50,9 +51,12 @@ type ReviewPanelProps = {
   /** Renderable diffs and their change kinds, computed once by the review model. */
   diffs: FileDiffInfo[]
   kinds: ReturnType<typeof reviewDiffKinds>
+  /** Labels for opened untracked folders in the change tree. */
+  folderLabels?: ReadonlyMap<string, string>
   diffsReady: boolean
   diffVersion?: number
   loadDiff?: (path: string, version?: number) => Promise<RenderDiff | undefined>
+  readFile: ReviewModel["readFile"]
   activeFile?: string
   onSelectFile: (path: string) => void
   diffStyle: SessionReviewDiffStyle
@@ -86,9 +90,11 @@ export default function ReviewPanelContent(props: {
       empty={<ReviewPanelEmpty review={props.review} />}
       diffs={props.review.renderable()}
       kinds={props.review.kinds()}
+      folderLabels={props.review.folderLabels()}
       diffsReady={props.review.ready()}
       diffVersion={props.review.diffVersion()}
       loadDiff={props.review.loadDiff}
+      readFile={props.review.readFile}
       activeFile={props.review.activeFile()}
       onSelectFile={props.review.focusFile}
       diffStyle={props.diffStyle}
@@ -120,27 +126,26 @@ function ReviewPanel(props: ReviewPanelProps) {
     return live.status === "active" ? live.value : undefined
   }
 
-  const readFile = async (path: string) =>
-    props.session.server.client.file
-      .read({ path, location: { directory: props.screen.file.root } })
-      .then((data) => ({ type: "text" as const, content: new TextDecoder().decode(data) }))
-      .catch((error) => {
-        console.debug("[session-review-v2] failed to read file", { path, error })
-
-        return undefined
-      })
-
   const diffs = () => props.diffs
 
-  const filteredFiles = createMemo(() =>
-    filterReviewFiles(
-      diffs().map((diff) => diff.file),
+  const searching = createMemo(() => props.state.filter().trim().length > 0)
+
+  // A folder row opens in the change tree; searches and the preview list files only.
+  const filteredFiles = createMemo(() => {
+    const files = diffs().map((diff) => diff.file)
+
+    if (!searching()) return files
+
+    return filterReviewFiles(
+      files.filter((file) => !isReviewFolder(file)),
       props.state.filter(),
-    ),
+    )
+  })
+
+  const navigationFiles = createMemo(() =>
+    searching() ? filteredFiles() : sortReviewPaths(filteredFiles().filter((file) => !isReviewFolder(file))),
   )
 
-  const searching = createMemo(() => props.state.filter().trim().length > 0)
-  const navigationFiles = createMemo(() => (searching() ? filteredFiles() : sortReviewPaths(filteredFiles())))
   const kinds = () => props.kinds
   // Changes-only trees omit "M" — every row is already a change; A/D stay visible.
   const treeKinds = createMemo(() => new Map([...kinds()].filter(([, kind]) => kind !== "mix")))
@@ -219,6 +224,7 @@ function ReviewPanel(props: ReviewPanelProps) {
           filteredFiles={filteredFiles()}
           searching={searching()}
           kinds={treeKinds()}
+          folderLabels={props.folderLabels}
           activeDiff={activeDiff()}
         />
       }
@@ -242,7 +248,7 @@ function ReviewPanel(props: ReviewPanelProps) {
                   diff={diff()}
                   diffStyle={props.diffStyle}
                   expandMode={props.state.expandMode()}
-                  readFile={readFile}
+                  readFile={props.readFile}
                   onLineComment={props.onLineComment}
                   onLineCommentUpdate={props.onLineCommentUpdate}
                   onLineCommentDelete={props.onLineCommentDelete}
@@ -271,6 +277,7 @@ function ReviewPanelSidebar(props: {
   filteredFiles: string[]
   searching: boolean
   kinds: ReturnType<typeof reviewDiffKinds>
+  folderLabels?: ReadonlyMap<string, string>
   activeDiff: string | undefined
 }) {
   const ctx = useExtension<typeof Review>()
@@ -338,6 +345,7 @@ function ReviewPanelSidebar(props: {
                   session={props.session}
                   allowed={props.filteredFiles}
                   kinds={props.kinds}
+                  labels={props.folderLabels}
                   active={props.activeDiff}
                   onFileClick={props.onSelectFile}
                 />

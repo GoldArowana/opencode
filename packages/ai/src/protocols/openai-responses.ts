@@ -1,19 +1,22 @@
-import { Effect, Encoding, Schema } from "effect"
-import { Headers } from "effect/unstable/http"
+import { Effect, Schema } from "effect"
+import { Base64 } from "effect/encoding"
+import { Headers } from "effect/http"
 import { Route } from "../route/client.js"
 import { Auth } from "../route/auth.js"
 import { Endpoint } from "../route/endpoint.js"
 import { Protocol } from "../route/protocol.js"
 import { HttpTransport } from "../route/transport/index.js"
 import { LLMRequest, type ToolDefinition, type ToolEntry } from "../schema/index.js"
+import { requestTTL } from "../cache-policy.js"
 import { resolveEffortUpdates } from "../effort-updates.js"
 import { OpenResponses } from "./open-responses.js"
 import { OpenResponsesOptions } from "./utils/open-responses-options.js"
-import { JsonObject, optionalArray, optionalNull, ProviderShared } from "./shared.js"
+import { JsonObject, lenient, optionalArray, optionalNull, ProviderShared } from "./shared.js"
 import { ResponsesHostedTools } from "./utils/responses-hosted-tools.js"
 import { OpenResponsesChannel } from "./open-responses-channel.js"
 import { ResponsesCompaction } from "./utils/responses-compaction.js"
 import { ResponsesCheckpoint } from "./utils/responses-checkpoint.js"
+import * as Cache from "./utils/cache.js"
 
 const ADAPTER = "openai-responses"
 const NAME = "OpenAI Responses"
@@ -29,6 +32,16 @@ export const ContextManagement = Schema.Array(
   }),
 )
 export type ContextManagement = typeof ContextManagement.Type
+
+export const ReasoningMode = ProviderShared.knownString<"standard" | "pro">()
+export type ReasoningMode = typeof ReasoningMode.Type
+export const ReasoningContext = ProviderShared.knownString<"auto" | "current_turn" | "all_turns">()
+export type ReasoningContext = typeof ReasoningContext.Type
+
+const ReasoningOptions = Schema.Struct({
+  reasoningMode: lenient(ReasoningMode),
+  reasoningContext: lenient(ReasoningContext),
+})
 
 const OpenAIResponsesImageGenerationTool = Schema.Struct({
   type: Schema.tag("image_generation"),
@@ -105,8 +118,18 @@ const OpenAIResponsesToolChoice = Schema.Union([
 
 const OpenAIResponsesCoreFields = {
   ...OpenResponses.coreFields,
+  prompt_cache_retention: Schema.optional(Schema.String),
+  prompt_cache_options: Schema.optional(Schema.Struct({ ttl: Schema.optional(Schema.String) })),
   tools: optionalArray(OpenAIResponsesTools),
   tool_choice: Schema.optional(OpenAIResponsesToolChoice),
+  reasoning: Schema.optional(
+    Schema.Struct({
+      effort: Schema.optional(OpenResponsesOptions.ReasoningEffort),
+      summary: Schema.optional(Schema.Literals(["auto", "concise", "detailed"])),
+      mode: Schema.optional(ReasoningMode),
+      context: Schema.optional(ReasoningContext),
+    }),
+  ),
   context_management: Schema.optional(
     Schema.Array(
       Schema.Struct({
@@ -140,6 +163,7 @@ const adapter = {
 // or alongside automatic `context_management` compaction.
 const supportsEffortUpdates = (request: LLMRequest) => {
   if (request.providerOptions?.contextManagement !== undefined) return false
+  if (request.providerOptions?.reasoningMode === "pro") return false
   if (Schema.is(Schema.Struct({ mode: Schema.Literal("pro") }))(request.http?.body?.reasoning)) return false
   const override = request.model.compatibility?.supportsEffortUpdates
   if (override !== undefined) return override
@@ -200,16 +224,28 @@ const fromRequest = Effect.fn("OpenAIResponses.fromRequest")(function* (request:
     Schema.decodeUnknownEffect(Schema.UndefinedOr(ContextManagement)),
   )(request.providerOptions?.contextManagement)
   const options = OpenResponsesOptions.resolve(request)
+  const reasoning = Schema.decodeUnknownSync(ReasoningOptions)(request.providerOptions ?? {})
   const updates = resolveEffortUpdates(request, options.reasoningEffort)
+  const generation = OpenResponses.lowerGeneration(request, { ...options, reasoningEffort: updates.effort })
   return {
     ...(yield* OpenResponses.lowerConversation(updates.request, adapter)),
-    ...OpenResponses.lowerGeneration(request, { ...options, reasoningEffort: updates.effort }),
+    ...generation,
+    ...Cache.openAIRequestTTL(requestTTL(request)),
+    ...(generation.reasoning || reasoning.reasoningMode || reasoning.reasoningContext
+      ? {
+          reasoning: {
+            ...generation.reasoning,
+            mode: reasoning.reasoningMode,
+            context: reasoning.reasoningContext,
+          },
+        }
+      : {}),
     context_management: management?.map((edit) => ({ type: edit.type, compact_threshold: edit.compactThreshold })),
     tools: request.tools.length === 0 ? undefined : yield* lowerTools(request),
     tool_choice:
       request.tools.length === 0
         ? undefined
-        : (OpenResponses.allowedToolChoice(request) ??
+        : (OpenResponses.allowedToolChoice(request, options) ??
           (request.toolChoice ? yield* lowerToolChoice(request.toolChoice, request.tools) : undefined)),
   }
 })
@@ -240,7 +276,7 @@ const checkpointBody = {
 const hostedToolResult = Effect.fnUntraced(function* (item: ResponsesHostedTools.Item) {
   const isError = item.error !== undefined && item.error !== null
   if (item.type === "image_generation_call" && item.result) {
-    yield* Effect.fromResult(Encoding.decodeBase64(item.result)).pipe(
+    yield* Effect.fromResult(Base64.decode(item.result)).pipe(
       Effect.mapError((cause) =>
         ProviderShared.eventError(ADAPTER, "OpenAI Responses returned invalid image base64", undefined, cause),
       ),

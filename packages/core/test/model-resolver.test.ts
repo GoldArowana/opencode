@@ -1,9 +1,9 @@
 import { describe, expect } from "bun:test"
-import { LLM, LanguageModel, Message } from "@opencode/ai"
+import { LLM, LanguageModel, Message } from "@opencode/ai/effect"
 import { OpenAIChat } from "@opencode/ai/protocols"
-import { compileRequest } from "@opencode/ai/route/client"
+import { compileRequest } from "@opencode/ai/testing"
 import { ConfigProvider, Effect, Layer } from "effect"
-import { Headers } from "effect/unstable/http"
+import { Headers } from "effect/http"
 import { AISDKNative } from "@opencode/core/aisdk-native"
 import { Credential } from "@opencode/core/credential"
 import { Integration } from "@opencode/core/integration"
@@ -238,6 +238,24 @@ describe("ModelResolver", () => {
           endpoint: { baseURL: "https://bedrock-mantle.us-west-2.api.aws/openai/v1" },
         })
         expect(catalog.settings?.baseURL).toBe("https://bedrock-mantle.us-west-2.api.aws/openai/v1")
+      }),
+    ),
+  )
+
+  it.effect("fills Mantle catalog URLs from the provider region", () =>
+    withEnv({ AWS_REGION: undefined, AWS_DEFAULT_REGION: undefined }, () =>
+      Effect.gen(function* () {
+        const catalog = model(Provider.aisdk("@ai-sdk/amazon-bedrock/mantle"), {
+          providerID: Provider.ID.amazonBedrock,
+          modelID: "openai.gpt-5.5",
+          settings: { baseURL: "https://bedrock-mantle.${AWS_REGION}.api.aws/openai/v1" },
+        })
+        const resolved = yield* ModelResolver.fromCatalogModel({
+          ...catalog,
+          settings: Provider.mergeOverlay({ region: "us-west-2" }, catalog.settings),
+        })
+
+        expect(resolved.route.endpoint.baseURL).toBe("https://bedrock-mantle.us-west-2.api.aws/openai/v1")
       }),
     ),
   )
@@ -981,6 +999,7 @@ describe("ModelResolver", () => {
       const packages = [
         ["@opencode/ai/providers/google-vertex", "accessToken"],
         ["@opencode/ai/providers/google-vertex/gemini", "accessToken"],
+        ["@opencode/ai/providers/google-vertex/interactions", "accessToken"],
         ["@opencode/ai/providers/google-vertex/chat", "accessToken"],
         ["@opencode/ai/providers/google-vertex/responses", "accessToken"],
         ["@opencode/ai/providers/google-vertex/messages", "accessToken"],
@@ -1335,7 +1354,7 @@ describe("ModelResolver", () => {
         Credential.Key.make({
           type: "key",
           key: "workers-secret",
-          configuration: { accountId: "account" },
+          metadata: { accountId: "account" },
         }),
       )
 
@@ -1396,7 +1415,7 @@ describe("ModelResolver", () => {
         Credential.Key.make({
           type: "key",
           key: "fallback-secret",
-          configuration: { accountId: "account" },
+          metadata: { accountId: "account" },
         }),
         {
           loadAISDK: (runtime) =>
