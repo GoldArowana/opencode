@@ -149,7 +149,6 @@ test("a pending missing-session deletion only closes tabs on its originating ser
   const dialog = page.getByRole("dialog")
   await dialog.getByRole("button", { name: "Delete session" }).click()
   expect(await deleting.promise).toBe(sessionA.id)
-  await dialog.getByRole("button", { name: "Cancel", exact: true }).click()
   await expect(dialog).toBeHidden()
   const local = page.locator(`[data-slot="titlebar-tabs"] a[href="${sessionHref(sessionA.id)}"]`)
   const remote = page.locator(`[data-slot="titlebar-tabs"] a[href="${sessionHref(sessionA.id, REMOTE_SERVER)}"]`)
