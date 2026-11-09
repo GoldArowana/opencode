@@ -1,0 +1,81 @@
+name: OpenCode 56691 stale boundary diagnostic d8091d2b
+on:
+  push:
+    branches: ['codex-ci/opencode56691-boundary-d8091d2b']
+permissions:
+  contents: read
+jobs:
+  reproduce:
+    if: github.repository == 'GoldArowana/opencode'
+    name: Shell undo (${{ matrix.label }})
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        include:
+          - label: diagnostic-stale-boundary
+            sha: bdf353e276b58fdeecd9350a49fefe7d8e3f54e0
+            tree: 0aa026c6b8629afa2cb42d1a844335e34d395217
+            parents: 'a58d273a81934e3262e13901d59edbd697631d87'
+    env:
+      CI: 'true'
+    steps:
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
+        with:
+          repository: GoldArowana/opencode
+          ref: '${{ matrix.sha }}'
+          path: source
+          fetch-depth: 1
+          persist-credentials: false
+      - name: Assert exact source identity and clean tracked bytes
+        working-directory: source
+        run: |
+          test "$(git rev-parse HEAD)" = '${{ matrix.sha }}'
+          test "$(git rev-parse HEAD^{tree})" = '${{ matrix.tree }}'
+          parents="$(git cat-file -p HEAD | awk '$1 == "parent" {print $2}' | paste -sd ' ' -)"
+          test "$parents" = '${{ matrix.parents }}'
+          printf 'VALIDATION_SOURCE %s tree=%s parents=%s\n' '${{ matrix.sha }}' '${{ matrix.tree }}' "$parents"
+          git diff HEAD --exit-code
+          git config --local user.name 'OpenCode CI'
+          git config --local user.email 'opencode-ci@example.invalid'
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: '24'
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-download-url: https://github.com/oven-sh/bun/releases/download/bun-v1.4.4/bun-linux-x64-baseline.zip
+      - name: Bootstrap frozen dependencies
+        id: bootstrap
+        working-directory: source
+        timeout-minutes: 12
+        run: |
+          test "$(bun --version)" = '1.4.4'
+          test "$(node -p "require('./package.json').packageManager")" = 'bun@1.4.4'
+          node --version
+          bun --version
+          if ! python3 -c 'import setuptools'; then
+            python3 -m venv "$RUNNER_TEMP/opencode-python"
+            export PATH="$RUNNER_TEMP/opencode-python/bin:$PATH"
+            python3 -m pip install --no-cache-dir setuptools
+          fi
+          bun install --frozen-lockfile --no-cache
+          git diff HEAD --exit-code
+      - name: Run explicit two-commit boundary witness
+        working-directory: source
+        timeout-minutes: 5
+        run: |
+          bun run --cwd packages/core test test/session-shell.test.ts --test-name-pattern 'baseline diagnostic: two shells attempt the same staged undo'
+      - name: Check diagnostic fixture types
+        if: always() && steps.bootstrap.outcome == 'success'
+        working-directory: source
+        timeout-minutes: 5
+        run: bun run --cwd packages/core typecheck
+      - name: Check tracked source at exit
+        if: always()
+        working-directory: source
+        run: |
+          test "$(git rev-parse HEAD)" = '${{ matrix.sha }}'
+          test "$(git rev-parse HEAD^{tree})" = '${{ matrix.tree }}'
+          git diff HEAD --exit-code
