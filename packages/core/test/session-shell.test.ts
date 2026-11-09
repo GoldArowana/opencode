@@ -1,7 +1,7 @@
 import { describe, expect, setDefaultTimeout } from "bun:test"
 import fs from "fs/promises"
 import path from "path"
-import { Cause, Context, Deferred, Effect, Exit, Fiber, Layer, Option, Schedule, Stream, Tracer } from "effect"
+import { Cause, Context, Deferred, Effect, Exit, Fiber, Layer, Option, Schedule, Scheduler, Stream, Tracer } from "effect"
 import { Bus } from "@opencode/core/bus"
 import { Database } from "@opencode/core/database/database"
 import { AppNodeBuilder } from "@opencode/core/effect/app-node-builder"
@@ -59,16 +59,19 @@ const executionLayer = Layer.effect(
   }),
 )
 
-const it = testEffect(
+const shellTestLayer = (bus = Bus.configured({ persist: true }), shell?: typeof Shell.node) =>
   AppNodeBuilder.build(
     LayerNode.group([Database.node, Bus.node, Session.node, SessionExecution.node, LocationServiceMap.node]),
     [
-      Bus.node.replace(Bus.configured({ persist: true })),
+      Bus.node.replace(bus),
+      ...(shell ? [Shell.node.replace(shell)] : []),
       SessionExecution.node.replace(executionLayer.pipe(Layer.provide(controlLayer))),
       offlineModels,
     ],
-  ).pipe(Layer.provideMerge(controlLayer)),
-)
+  ).pipe(Layer.provideMerge(controlLayer))
+
+const it = testEffect(shellTestLayer())
+const overlap = testEffect(Layer.empty)
 
 const setup = Effect.gen(function* () {
   const tmp = yield* tmpdirScoped()
@@ -132,6 +135,135 @@ const launch = Effect.fn(function* (fixture: Effect.Success<typeof setup>, name:
 })
 
 describe("Session.shell", () => {
+  overlap.live("commits staged undo once when two shells are ready together", () =>
+    Effect.gen(function* () {
+      const commands = ["echo overlap-a", "echo overlap-b"] as const
+      const firstReady = yield* Deferred.make<void>()
+      const secondReady = yield* Deferred.make<void>()
+      const releaseFirst = yield* Deferred.make<void>()
+      const releaseSecond = yield* Deferred.make<void>()
+      const releaseCommit = yield* Deferred.make<void>()
+      let attempts = 0
+
+      const shell = Shell.node.mapLayer((layer) =>
+        Layer.effect(
+          Shell.Service,
+          Effect.map(Shell.Service, (service) => {
+            const create: Shell.Interface["create"] = (input, before) =>
+              service.create(input, before).pipe(
+                Effect.tap(() => {
+                  if (input.command === commands[0])
+                    return Deferred.succeed(firstReady, undefined).pipe(Effect.andThen(Deferred.await(releaseFirst)))
+                  if (input.command === commands[1])
+                    return Deferred.succeed(secondReady, undefined).pipe(Effect.andThen(Deferred.await(releaseSecond)))
+                  return Effect.void
+                }),
+              )
+            return Shell.Service.of({ ...service, create })
+          }),
+        ).pipe(Layer.provide(layer)),
+      )
+      const bus = Bus.configured({ persist: true }).mapLayer((layer) =>
+        Layer.effect(
+          Bus.Service,
+          Effect.map(Bus.Service, (service) => {
+            const publish: Bus.Interface["publish"] = (definition, data, options) => {
+              const publish = service.publish(definition, data, options)
+              if (definition.type !== SessionEvent.RevertEvent.Committed.type) return publish
+              return Effect.sync(() => {
+                attempts += 1
+              }).pipe(Effect.andThen(Deferred.await(releaseCommit)), Effect.andThen(publish))
+            }
+            return Bus.Service.of({ ...service, publish })
+          }),
+        ).pipe(Layer.provide(layer)),
+      )
+
+      // Keep the real shell I/O live until both create calls report readiness. Then drain
+      // the post-start continuations ourselves while the first publish is parked before the bus lock.
+      let paused = false
+      const queued: Array<() => void> = []
+      const scheduler = new Scheduler.MixedScheduler("async", (run) => {
+        let cancelled = false
+        const dispatch = () => {
+          if (!cancelled) run()
+        }
+        if (paused) queued.push(dispatch)
+        else queueMicrotask(dispatch)
+        return () => {
+          cancelled = true
+        }
+      })
+      const drain = () => {
+        for (let dispatched = 0; queued.length > 0; dispatched++) {
+          if (dispatched === 256) throw new Error("shell continuations did not quiesce")
+          queued.shift()?.()
+        }
+      }
+      const release = Effect.sync(() => {
+        paused = false
+        for (const dispatch of queued.splice(0)) queueMicrotask(dispatch)
+      }).pipe(
+        Effect.andThen(Deferred.succeed(releaseFirst, undefined)),
+        Effect.andThen(Deferred.succeed(releaseSecond, undefined)),
+        Effect.andThen(Deferred.succeed(releaseCommit, undefined)),
+        Effect.asVoid,
+      )
+
+      yield* Effect.gen(function* () {
+        const fixture = yield* setup
+        const reverted = yield* undo(fixture)
+        const run = (command: string) =>
+          fixture.session
+            .shell({ sessionID: fixture.created.id, command })
+            .pipe(Effect.provideService(Scheduler.Scheduler, scheduler), Effect.forkScoped)
+
+        const first = yield* run(commands[0])
+        const second = yield* run(commands[1])
+        const [afterFirst, afterBoth] = yield* Effect.gen(function* () {
+          yield* Deferred.await(firstReady).pipe(Effect.timeout("5 seconds"))
+          yield* Deferred.await(secondReady).pipe(Effect.timeout("5 seconds"))
+          paused = true
+          yield* Deferred.succeed(releaseFirst, undefined)
+          drain()
+          const afterFirst = attempts
+          yield* Deferred.succeed(releaseSecond, undefined)
+          drain()
+          return [afterFirst, attempts] as const
+        }).pipe(Effect.ensuring(release))
+
+        // Release is unconditional. A correct implementation may park the second caller
+        // before it can read the undo state, so waiting for its publish would deadlock.
+        const exits = [yield* Fiber.await(first), yield* Fiber.await(second)]
+        expect({ afterFirst, afterBoth, exits: exits.map((exit) => exit._tag) }).toMatchObject({
+          afterFirst: 1,
+          exits: ["Success", "Success"],
+        })
+        const events = yield* log(fixture.session, fixture.created.id).pipe(Stream.runCollect)
+        expect(events.filter((event) => event.type === "session.revert.committed")).toMatchObject([
+          { data: { to: reverted.messageID } },
+        ])
+        expect(events.filter((event) => event.type === "session.shell.started")).toHaveLength(2)
+        expect(events.filter((event) => event.type === "session.shell.ended")).toHaveLength(2)
+        expect((yield* fixture.session.get(fixture.created.id)).revert).toBeUndefined()
+        const messages = yield* fixture.session.messages({ sessionID: fixture.created.id })
+        expect(messages).toHaveLength(2)
+        expect(messages).toEqual(
+          expect.arrayContaining(
+            ["overlap-a", "overlap-b"].map((text) =>
+              expect.objectContaining({
+                type: "shell",
+                status: "exited",
+                exit: 0,
+                output: { output: expect.stringContaining(text) },
+              }),
+            ),
+          ),
+        )
+      }).pipe(Effect.provide(shellTestLayer(bus, shell)))
+    }),
+  )
+
   it.live("commits staged undo before accepting a shell and retains repeated shell output", () =>
     Effect.gen(function* () {
       const fixture = yield* setup
