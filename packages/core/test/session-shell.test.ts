@@ -59,16 +59,18 @@ const executionLayer = Layer.effect(
   }),
 )
 
-const it = testEffect(
+const shellTestLayer = (bus = Bus.configured({ persist: true })) =>
   AppNodeBuilder.build(
     LayerNode.group([Database.node, Bus.node, Session.node, SessionExecution.node, LocationServiceMap.node]),
     [
-      Bus.node.replace(Bus.configured({ persist: true })),
+      Bus.node.replace(bus),
       SessionExecution.node.replace(executionLayer.pipe(Layer.provide(controlLayer))),
       offlineModels,
     ],
-  ).pipe(Layer.provideMerge(controlLayer)),
-)
+  ).pipe(Layer.provideMerge(controlLayer))
+
+const it = testEffect(shellTestLayer())
+const diagnostic = testEffect(Layer.empty)
 
 const setup = Effect.gen(function* () {
   const tmp = yield* tmpdirScoped()
@@ -132,6 +134,106 @@ const launch = Effect.fn(function* (fixture: Effect.Success<typeof setup>, name:
 })
 
 describe("Session.shell", () => {
+  diagnostic.live("baseline diagnostic: two shells attempt the same staged undo", () =>
+    Effect.gen(function* () {
+      const commands = ["echo overlap-a", "echo overlap-b"] as const
+      const firstEntered = yield* Deferred.make<string>()
+      const secondEntered = yield* Deferred.make<string>()
+      const firstApplied = yield* Deferred.make<void>()
+      const releaseFirst = yield* Deferred.make<void>()
+      const releaseSecond = yield* Deferred.make<void>()
+      let attempts = 0
+
+      const bus = Bus.configured({ persist: true }).mapLayer((layer) =>
+        Layer.effect(
+          Bus.Service,
+          Effect.map(Bus.Service, (service) => {
+            const publish: Bus.Interface["publish"] = (definition, data, options) => {
+              const forward = service.publish(definition, data, options)
+              if (definition.type !== SessionEvent.RevertEvent.Committed.type) return forward
+              return Effect.gen(function* () {
+                const boundary = typeof data === "object" && data !== null && "to" in data ? String(data.to) : ""
+                attempts += 1
+                if (attempts === 1) {
+                  yield* Deferred.succeed(firstEntered, boundary)
+                  yield* Deferred.await(releaseFirst)
+                  const committed = yield* forward
+                  yield* Deferred.succeed(firstApplied, undefined)
+                  return committed
+                }
+                yield* Deferred.succeed(secondEntered, boundary)
+                yield* Deferred.await(releaseSecond)
+                return yield* forward
+              })
+            }
+            return Bus.Service.of({ ...service, publish })
+          }),
+        ).pipe(Layer.provide(layer)),
+      )
+      const wait = <A>(gate: Deferred.Deferred<A>, phase: string) =>
+        Deferred.await(gate).pipe(
+          Effect.timeout("10 seconds"),
+          Effect.catch(() => Effect.die(new Error(`baseline diagnostic timed out waiting for ${phase}`))),
+        )
+      const release = Deferred.succeed(releaseFirst, undefined).pipe(
+        Effect.andThen(Deferred.succeed(releaseSecond, undefined)),
+        Effect.asVoid,
+      )
+
+      yield* Effect.gen(function* () {
+        const fixture = yield* setup
+        const staged = yield* undo(fixture)
+        const launch = (command: string) =>
+          fixture.session.shell({ sessionID: fixture.created.id, command }).pipe(Effect.forkScoped)
+        const first = yield* launch(commands[0])
+        const second = yield* Effect.gen(function* () {
+          const firstBoundary = yield* wait(firstEntered, "A's post-start commit attempt")
+          const second = yield* launch(commands[1])
+          // Baseline-only: B must make the same commit decision while A is still parked
+          // outside the bus. A serialized candidate can intentionally prevent this step.
+          const secondBoundary = yield* wait(secondEntered, "B's post-start commit attempt")
+          expect([firstBoundary, secondBoundary]).toEqual([staged.messageID, staged.messageID])
+          yield* Deferred.succeed(releaseFirst, undefined)
+          yield* wait(firstApplied, "A's durable commit")
+          yield* Deferred.succeed(releaseSecond, undefined)
+          return second
+        }).pipe(Effect.ensuring(release))
+
+        const exits = [yield* Fiber.await(first), yield* Fiber.await(second)]
+        const failures = exits.flatMap((exit) =>
+          Exit.isFailure(exit) ? Cause.prettyErrors(exit.cause).map((error) => error.message) : [],
+        )
+        const events = yield* log(fixture.session, fixture.created.id).pipe(Stream.runCollect)
+        const messages = (yield* fixture.session.messages({ sessionID: fixture.created.id }))
+          .flatMap((message) =>
+            message.type === "shell" && message.status === "exited"
+              ? [{ command: message.command, exit: message.exit, output: message.output?.output }]
+              : [],
+          )
+          .sort((left, right) => left.command.localeCompare(right.command))
+        console.info(
+          "OPENCODE_56691_OVERLAP_WITNESS",
+          JSON.stringify({
+            boundary: staged.messageID,
+            attempts,
+            exits: exits.map((exit) => exit._tag),
+            failures,
+            events: events.map((event) => event.type),
+            messages,
+          }),
+        )
+        expect(exits.map((exit) => exit._tag)).toEqual(["Success", "Success"])
+        expect(events.filter((event) => event.type === "session.revert.committed")).toHaveLength(1)
+        expect(events.filter((event) => event.type === "session.shell.started")).toHaveLength(2)
+        expect(events.filter((event) => event.type === "session.shell.ended")).toHaveLength(2)
+        expect(messages).toMatchObject([
+          { command: commands[0], exit: 0, output: expect.stringContaining("overlap-a") },
+          { command: commands[1], exit: 0, output: expect.stringContaining("overlap-b") },
+        ])
+      }).pipe(Effect.provide(shellTestLayer(bus)))
+    }),
+  )
+
   it.live("commits staged undo before accepting a shell and retains repeated shell output", () =>
     Effect.gen(function* () {
       const fixture = yield* setup
