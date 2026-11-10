@@ -1,7 +1,7 @@
 import { describe, expect, setDefaultTimeout } from "bun:test"
 import fs from "fs/promises"
 import path from "path"
-import { Cause, Context, Deferred, Effect, Exit, Fiber, Layer, Option, Schedule, Stream } from "effect"
+import { Cause, Context, Deferred, Effect, Exit, Fiber, Layer, Option, Schedule, Stream, Tracer } from "effect"
 import { Bus } from "@opencode/core/bus"
 import { Database } from "@opencode/core/database/database"
 import { AppNodeBuilder } from "@opencode/core/effect/app-node-builder"
@@ -59,16 +59,19 @@ const executionLayer = Layer.effect(
   }),
 )
 
-const it = testEffect(
+const shellTestLayer = (bus = Bus.configured({ persist: true }), shell?: typeof Shell.node) =>
   AppNodeBuilder.build(
     LayerNode.group([Database.node, Bus.node, Session.node, SessionExecution.node, LocationServiceMap.node]),
     [
-      Bus.node.replace(Bus.configured({ persist: true })),
+      Bus.node.replace(bus),
+      ...(shell ? [Shell.node.replace(shell)] : []),
       SessionExecution.node.replace(executionLayer.pipe(Layer.provide(controlLayer))),
       offlineModels,
     ],
-  ).pipe(Layer.provideMerge(controlLayer)),
-)
+  ).pipe(Layer.provideMerge(controlLayer))
+
+const it = testEffect(shellTestLayer())
+const overlap = testEffect(Layer.empty)
 
 const setup = Effect.gen(function* () {
   const tmp = yield* tmpdirScoped()
@@ -88,6 +91,18 @@ const undo = Effect.fn(function* (fixture: Effect.Success<typeof setup>) {
   yield* SessionInbox.promote(database.db, bus, fixture.created.id, "steer")
   return yield* fixture.session.revert.stage({ sessionID: fixture.created.id, messageID: prompt.id, files: false })
 })
+
+const recordSpans = () => {
+  const spans: Tracer.NativeSpan[] = []
+  const tracer = Tracer.make({
+    span(options) {
+      const span = new Tracer.NativeSpan(options)
+      spans.push(span)
+      return span
+    },
+  })
+  return { spans, tracer }
+}
 
 const log = (session: Session.Interface, sessionID: Session.ID, follow = false) =>
   session.log({ sessionID, follow }).pipe(Stream.filter((event) => !Bus.isSynced(event)))
@@ -120,6 +135,87 @@ const launch = Effect.fn(function* (fixture: Effect.Success<typeof setup>, name:
 })
 
 describe("Session.shell", () => {
+  overlap.live("keeps both shell outputs when undo settlement overlaps another shell startup", () =>
+    Effect.gen(function* () {
+      const commands = ["echo overlap-a", "echo overlap-b"] as const
+      const firstCommitting = yield* Deferred.make<void>()
+      const secondStarted = yield* Deferred.make<void>()
+      const release = yield* Deferred.make<void>()
+      let held = false
+
+      const bus = Bus.configured({ persist: true }).mapLayer((layer) =>
+        Layer.effect(
+          Bus.Service,
+          Effect.map(Bus.Service, (service) => {
+            const publish: Bus.Interface["publish"] = (definition, data, options) => {
+              const forward = service.publish(definition, data, options)
+              if (definition.type !== SessionEvent.RevertEvent.Committed.type) return forward
+              return Effect.suspend(() => {
+                if (held) return forward
+                held = true
+                return Deferred.succeed(firstCommitting, undefined).pipe(
+                  Effect.andThen(Deferred.await(release)),
+                  Effect.andThen(forward),
+                )
+              })
+            }
+            return Bus.Service.of({ ...service, publish })
+          }),
+        ).pipe(Layer.provide(layer)),
+      )
+      const shell = Shell.node.mapLayer((layer) =>
+        Layer.effect(
+          Shell.Service,
+          Effect.map(Shell.Service, (service) => {
+            const create: Shell.Interface["create"] = (input, before) =>
+              service.create(input, before).pipe(
+                Effect.tap(() =>
+                  input.command === commands[1] ? Deferred.succeed(secondStarted, undefined) : Effect.void,
+                ),
+              )
+            return Shell.Service.of({ ...service, create })
+          }),
+        ).pipe(Layer.provide(layer)),
+      )
+
+      yield* Effect.gen(function* () {
+        const fixture = yield* setup
+        const staged = yield* undo(fixture)
+        const launch = (command: string) =>
+          fixture.session.shell({ sessionID: fixture.created.id, command }).pipe(Effect.forkScoped)
+        const first = yield* launch(commands[0])
+        const second = yield* Effect.gen(function* () {
+          yield* Deferred.await(firstCommitting).pipe(Effect.timeout("10 seconds"))
+          const second = yield* launch(commands[1])
+          // Wait for the real child to start, not for B to enter the guarded undo path.
+          yield* Deferred.await(secondStarted).pipe(Effect.timeout("10 seconds"))
+          return second
+        }).pipe(Effect.ensuring(Deferred.succeed(release, undefined).pipe(Effect.asVoid)))
+        yield* Fiber.join(first)
+        yield* Fiber.join(second)
+
+        const events = yield* log(fixture.session, fixture.created.id).pipe(Stream.runCollect)
+        expect(events.filter((event) => event.type === "session.revert.committed")).toMatchObject([
+          { data: { to: staged.messageID } },
+        ])
+        expect(events.filter((event) => event.type === "session.shell.started")).toHaveLength(2)
+        expect(events.filter((event) => event.type === "session.shell.ended")).toHaveLength(2)
+        expect((yield* fixture.session.get(fixture.created.id)).revert).toBeUndefined()
+        const messages = (yield* fixture.session.messages({ sessionID: fixture.created.id }))
+          .flatMap((message) =>
+            message.type === "shell" && message.status === "exited"
+              ? [{ command: message.command, exit: message.exit, output: message.output?.output }]
+              : [],
+          )
+          .sort((left, right) => left.command.localeCompare(right.command))
+        expect(messages).toMatchObject([
+          { command: commands[0], exit: 0, output: expect.stringContaining("overlap-a") },
+          { command: commands[1], exit: 0, output: expect.stringContaining("overlap-b") },
+        ])
+      }).pipe(Effect.provide(shellTestLayer(bus, shell)))
+    }),
+  )
+
   it.live("commits staged undo before accepting a shell and retains repeated shell output", () =>
     Effect.gen(function* () {
       const fixture = yield* setup
@@ -368,8 +464,8 @@ describe("Session.shell", () => {
         expect(completion.payload.text).toContain(command)
         expect(completion.payload.text).toContain("user output")
         expect(completion.payload.text).toContain("user error")
-        if (exit === 0) expect(completion.payload.text).not.toContain("Exited with code")
-        if (exit !== 0) expect(completion.payload.text).toContain(`Exited with code ${exit}`)
+        if (exit === 0) expect(completion.payload.text).not.toContain("Exit code")
+        if (exit !== 0) expect(completion.payload.text).toContain(`\n\nExit code: ${exit}\n</shell>`)
         expect(fixture.control.wakes).toEqual([])
       }),
     )
@@ -382,7 +478,12 @@ describe("Session.shell", () => {
       text: "Cancelled",
       output: "Shell command output is no longer available.",
     },
-    { status: "timeout", state: "completed", text: "Timed out before completion", output: "timeout started" },
+    {
+      status: "timeout",
+      state: "completed",
+      text: "\n\nCommand timed out. If it needs longer and isn't waiting for input, rerun with a larger timeout.\nExit code: ",
+      output: "timeout started",
+    },
   ]) {
     it.live(`records a ${outcome.status} shell and admits its completion without waking the model`, () =>
       Effect.gen(function* () {
@@ -412,11 +513,43 @@ describe("Session.shell", () => {
             },
           },
         ])
-        expect(inbox[0]).not.toHaveProperty("payload.metadata.exit")
+        // A timed-out process still exits after the kill, so only a removed shell has no exit code.
+        if (outcome.status === "killed") expect(inbox[0]).not.toHaveProperty("payload.metadata.exit")
         expect(fixture.control.wakes).toEqual([])
       }),
     )
   }
+
+  it.live("names the session, a truncated command and the exit on shell spans outside any turn", () =>
+    Effect.gen(function* () {
+      const { spans, tracer } = recordSpans()
+      const fixture = yield* setup
+      // The emoji's two UTF-16 units sit at indexes 199 and 200, across the 200-unit cut.
+      const command = `exit 3 # ${"x".repeat(190)}😀${"x".repeat(100)}`
+      const truncated = `exit 3 # ${"x".repeat(190)}\uFFFD…`
+      yield* fixture.session.shell({ sessionID: fixture.created.id, command }).pipe(Effect.withTracer(tracer))
+
+      const create = spans.find((span) => span.name === "Shell.create")
+      const result = spans.find((span) => span.name === "Shell.result")
+      const shellID = create?.attributes.get("opencode.shell.id")
+      expect(shellID).toBeString()
+      expect(truncated.isWellFormed()).toBe(true)
+      expect(Object.fromEntries(create?.attributes ?? [])).toEqual({
+        "opencode.shell.id": shellID,
+        "opencode.shell.command": truncated,
+        "session.id": fixture.created.id,
+        "opencode.shell.background": true,
+      })
+      expect(Object.fromEntries(result?.attributes ?? [])).toEqual({
+        "opencode.shell.id": shellID,
+        "opencode.shell.command": truncated,
+        "session.id": fixture.created.id,
+        "opencode.shell.background": true,
+        "opencode.shell.status": "exited",
+        "process.exit.code": 3,
+      })
+    }),
+  )
 
   it.live("admits a spawn failure without waking the model before failing the caller", () =>
     Effect.gen(function* () {
